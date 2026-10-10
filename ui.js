@@ -156,12 +156,11 @@ function createExtractSection(api, setStatus) {
             setStatus(result.reason ?? '没有开始');
             return;
         }
-        const bits = [`合并后 ${result.results} 条关系`];
-        bits.push(`名字映射上 ${result.mapped}/${result.names} 个`);
+        const bits = [`《${result.novelName}》整理出 ${result.pairs} 对关系的称呼表`];
         if (result.failures) bits.push(`${result.failures} 块失败`);
         if (result.aborted) bits.push('（已中止）');
         if (result.stoppedEarly) bits.push('（连续失败，提前停了）');
-        setStatus(`提取完成：${bits.join('，')}。检查下面的映射，再点「采纳全部已映射」。`);
+        setStatus(`提取完成：${bits.join('，')}。`);
     });
 
     const abortBtn = button('中止', () => api.abortExtract(), 'stam-danger');
@@ -178,10 +177,10 @@ function createExtractSection(api, setStatus) {
     const mappingBox = el('div', { class: 'stam-mapping' });
 
     const actions = el('div', { class: 'stam-toolbar' }, [
-        button('采纳全部已映射', () => {
+        button('写进当前聊天的称呼表', () => {
             const outcome = api.applyExtract();
             if (!outcome.applied) {
-                setStatus('没有可采纳的行——先看下面的名字映射，有「未映射」就对一下。');
+                setStatus('没有可写的行——先看上面的映射，把「未映射」的名字对上。');
                 return;
             }
             setStatus(`已写入 ${outcome.applied} 对关系${outcome.unmapped.length ? `；${outcome.unmapped.length} 个名字没映射，已跳过：${outcome.unmapped.join('、')}` : ''}`);
@@ -189,23 +188,76 @@ function createExtractSection(api, setStatus) {
         }),
         button('存为全局默认库', () => {
             const count = api.saveExtractToLibrary();
-            setStatus(count ? `已把 ${count} 对关系存进全局默认库，别的聊天也能用` : '没有可存的关系（先完成名字映射）');
+            setStatus(count ? `已把 ${count} 对关系存进全局默认库，别的聊天不用映射也能用` : '没有可存的关系（先完成名字映射）');
             render();
         }),
-        button('清空提取结果', () => {
-            if (!window.confirm('清空本聊天的提取结果与名字映射？（不影响已经写进称呼关系表的内容）')) return;
+        button('清空本小说的称呼表', () => {
+            if (!window.confirm('清空这部小说提取出来的全部称呼？（小说条目保留，已写进聊天的关系不受影响）')) return;
             api.clearExtract();
-            setStatus('已清空提取结果');
+            setStatus('已清空称呼表');
             render();
         }, 'stam-danger'),
+    ]);
+
+    /* ---------- 小说库工具栏 ---------- */
+
+    const novelSelect = el('select', { id: 'stam-novel-select', class: 'stam-novel-select' });
+    novelSelect.addEventListener('change', () => {
+        api.setActiveNovel(novelSelect.value);
+        const text = api.getExtractText();
+        textarea.value = text;
+        setStatus('已切换小说');
+        render();
+    });
+
+    const newNovelBtn = button('新建', () => {
+        const name = window.prompt('新小说的名字（比如书名）', '');
+        if (name === null) return;
+        api.createNovel(name.trim());
+        textarea.value = api.getExtractText();
+        setStatus('已新建小说');
+        render();
+    });
+    const renameNovelBtn = button('重命名', () => {
+        const state = api.getExtractUiState();
+        if (!state.novel) return;
+        const name = window.prompt('新的名字', state.novel.name);
+        if (name === null) return;
+        api.renameNovel(state.novel.id, name.trim());
+        render();
+    });
+    const deleteNovelBtn = button('删除', () => {
+        const state = api.getExtractUiState();
+        if (!state.novel) return;
+        if (!window.confirm(`删除《${state.novel.name}》？提取出来的称呼表会一起没掉。`)) return;
+        api.deleteNovel(state.novel.id);
+        textarea.value = api.getExtractText();
+        setStatus('已删除小说');
+        render();
+    }, 'stam-danger');
+
+    const injectNovelCheck = el('input', { type: 'checkbox', id: 'stam-inject-novel' });
+    injectNovelCheck.addEventListener('change', () => {
+        api.setNovelInject(injectNovelCheck.checked);
+        setStatus(injectNovelCheck.checked ? '已开启：原著称呼表会一起注入提示词' : '已关闭原著称呼表注入');
+    });
+
+    const novelToolbar = el('div', { class: 'stam-toolbar' }, [
+        el('span', { class: 'stam-hint', text: '小说：' }),
+        novelSelect,
+        newNovelBtn,
+        renameNovelBtn,
+        deleteNovelBtn,
     ]);
 
     /* ---------- 组装 ---------- */
 
     const root = el('fieldset', { class: 'stam-box', id: 'stam-extract-box' }, [
-        el('legend', { text: '正文提取' }),
+        el('legend', { text: '小说称呼库' }),
+        el('div', { class: 'stam-hint', text: '先在这里把小说的称呼建立起来——跟当前开着哪个聊天无关，建好了以后哪个聊天都能拿来用。' }),
+        novelToolbar,
         el('details', { class: 'stam-extract', open: 'open' }, [
-            el('summary', { text: '从正文提取称呼（让模型自动生成称呼表）' }),
+            el('summary', { text: '导入正文并提取' }),
             el('div', { class: 'stam-extract-body' }, [
                 textarea,
                 el('div', { class: 'stam-toolbar' }, [
@@ -230,9 +282,26 @@ function createExtractSection(api, setStatus) {
                 progressWrap,
                 progressText,
                 logBox,
-                el('div', { class: 'stam-subtitle', text: '提取结果' }),
-                resultBox,
-                el('div', { class: 'stam-subtitle', text: '名字映射（小说人名 → 当前聊天里的角色）' }),
+            ]),
+        ]),
+        el('div', { class: 'stam-subtitle' }, [
+            el('span', { text: '称呼表' }),
+            el('span', { class: 'stam-hint', id: 'stam-table-count' }),
+        ]),
+        el('div', { class: 'stam-toolbar' }, [
+            button('复制表格', () => api.copyNovelTable()),
+            button('导出本小说 JSON', () => api.exportNovelFile()),
+            button('导入小说 JSON', () => api.importNovelFile()),
+            el('label', { class: 'stam-check' }, [injectNovelCheck, el('span', { text: '把这张表一起注入提示词' })]),
+        ]),
+        resultBox,
+        el('details', { class: 'stam-extract' }, [
+            el('summary', { text: '把这个称呼表用到当前聊天（可选）' }),
+            el('div', { class: 'stam-extract-body' }, [
+                el('div', {
+                    class: 'stam-hint',
+                    text: '小说的名字和聊天里的人不一定对得上，所以这里做一次映射。同名会自动对上，你只需要改错的那些。',
+                }),
                 mappingBox,
                 actions,
             ]),
@@ -264,9 +333,9 @@ function createExtractSection(api, setStatus) {
             progressBar.style.width = `${pct}%`;
             progressText.textContent = `进行中：第 ${state.progress.done}/${state.progress.total} 块（${pct}%）`;
             progressWrap.style.display = '';
-        } else if (state.extract.chunksTotal) {
+        } else if (state.novel?.chunksTotal) {
             progressBar.style.width = '100%';
-            progressText.textContent = `上次跑了 ${state.extract.chunksDone}/${state.extract.chunksTotal} 块。`;
+            progressText.textContent = `上次跑了 ${state.novel.chunksDone}/${state.novel.chunksTotal} 块。`;
             progressWrap.style.display = '';
         } else {
             progressWrap.style.display = 'none';
@@ -286,53 +355,66 @@ function createExtractSection(api, setStatus) {
 
     function renderResults(state) {
         resultBox.textContent = '';
-        const mapping = state.extract.mapping ?? {};
-        const results = state.extract.results ?? [];
-        if (!results.length) {
-            resultBox.append(el('div', { class: 'stam-hint', text: '还没有提取结果。' }));
+        const table = state.table ?? [];
+        const countLabel = document.getElementById('stam-table-count');
+        if (countLabel) {
+            countLabel.textContent = table.length
+                ? `共 ${table.length} 对关系，来自 ${state.novel?.results?.length ?? 0} 条原始记录`
+                : '';
+        }
+        if (!table.length) {
+            resultBox.append(el('div', {
+                class: 'stam-hint',
+                text: state.novel ? '这部小说还没有称呼。粘正文进来跑一次提取。' : '还没有小说。点上面「新建」，或直接粘正文跑提取（会自动建一部）。',
+            }));
             return;
         }
-        const shown = results.slice(0, 300);
         resultBox.append(el('div', { class: 'stam-x-rows' }, [
             el('div', { class: 'stam-x-row stam-x-head' }, [
-                el('div', { text: '关系' }),
+                el('div', { text: '称呼方 → 被称呼方' }),
                 el('div', { text: '称呼' }),
-                el('div', { text: '命中' }),
-                el('div', { text: '证据' }),
+                el('div', { text: '命中/置信' }),
+                el('div', { text: '别名' }),
             ]),
-            ...shown.map(item => {
-                const ready = Boolean(mapping[item.from]) && Boolean(mapping[item.to]);
-                return el('div', { class: `stam-x-row${ready ? '' : ' stam-x-unmapped'}` }, [
-                    el('div', { class: 'stam-pair' }, [
-                        el('span', { text: item.from }),
-                        el('span', { class: 'stam-arrow', text: '→' }),
-                        el('span', { text: item.to }),
-                        ready ? null : el('span', { class: 'stam-badge', text: '未映射' }),
-                    ]),
-                    el('strong', { text: item.call }),
-                    el('div', { class: 'stam-hint', text: `${item.count} 块 / ${(item.confidence * 100).toFixed(0)}%` }),
-                    el('div', { class: 'stam-hint', text: item.evidence?.[0] ?? '' }),
-                ]);
-            }),
+            ...table.slice(0, 400).map(row => el('div', { class: 'stam-x-row' }, [
+                el('div', { class: 'stam-pair' }, [
+                    el('span', { text: row.from }),
+                    el('span', { class: 'stam-arrow', text: '→' }),
+                    el('span', { text: row.to }),
+                ]),
+                el('strong', { text: row.call }),
+                el('div', { class: 'stam-hint', text: `${row.count} 块 / ${(row.confidence * 100).toFixed(0)}%` }),
+                el('div', { class: 'stam-hint', text: (row.aliases ?? []).join('、') }),
+            ])),
         ]));
-        if (results.length > shown.length) {
-            resultBox.append(el('div', { class: 'stam-hint', text: `还有 ${results.length - shown.length} 条未显示。` }));
+        if (table.length > 400) {
+            resultBox.append(el('div', { class: 'stam-hint', text: `还有 ${table.length - 400} 条未显示（复制表格或导出 JSON 能拿到全部）。` }));
+        }
+        const withEvidence = table.find(row => row.evidence?.length);
+        if (withEvidence) {
+            resultBox.append(el('details', { class: 'stam-help' }, [
+                el('summary', { text: '看几条原文证据（核对模型有没有编）' }),
+                el('div', {}, table.filter(r => r.evidence?.length).slice(0, 12).map(row =>
+                    el('div', { class: 'stam-hint', text: `${row.from} → ${row.to}「${row.call}」：${row.evidence[0]}` }))),
+            ]));
         }
     }
 
     function renderMapping(state) {
         mappingBox.textContent = '';
-        const names = state.names ?? [];
+        const names = [...new Set((state.table ?? []).flatMap(row => [row.from, row.to]))];
         if (!names.length) {
-            mappingBox.append(el('div', { class: 'stam-hint', text: '还没有要映射的人名。' }));
+            mappingBox.append(el('div', { class: 'stam-hint', text: '称呼表还是空的。' }));
             return;
         }
         const participants = state.participants ?? [];
+        if (participants.length < 2) {
+            mappingBox.append(el('div', { class: 'stam-hint', text: '当前没有打开聊天，写不进去。先打开一张卡或一个群聊。' }));
+            return;
+        }
         const user = participants.find(p => p.kind === 'user');
-        mappingBox.append(el('div', {
-            class: 'stam-hint',
-            text: '代词（我/你/他/她）不会自动映射——小说里的「我」多半是主角，不是坐在屏幕前的你。要指到你身上就手动选。',
-        }));
+        const mapped = names.filter(n => state.mapping?.[n]).length;
+        mappingBox.append(el('div', { class: 'stam-hint', text: `已对上 ${mapped}/${names.length} 个名字。代词（我/你/他）不会自动映射——小说里的「我」多半是主角，不是你。` }));
         for (const name of names) {
             const options = [
                 el('option', { value: '', text: '不映射' }),
@@ -340,13 +422,13 @@ function createExtractSection(api, setStatus) {
                 ...participants.filter(p => p.kind === 'character').map(p => el('option', { value: p.key, text: p.name })),
             ];
             const select = el('select', { class: 'stam-map-select' }, options);
-            select.value = state.extract.mapping?.[name] ?? '';
+            select.value = state.mapping?.[name] ?? '';
             select.addEventListener('change', () => {
                 api.setMapping(name, select.value);
                 render();
             });
-            const mapped = Boolean(state.extract.mapping?.[name]);
-            mappingBox.append(el('div', { class: `stam-map-row${mapped ? '' : ' stam-x-unmapped'}` }, [
+            const ok = Boolean(state.mapping?.[name]);
+            mappingBox.append(el('div', { class: `stam-map-row${ok ? '' : ' stam-x-unmapped'}` }, [
                 el('span', { class: 'stam-map-name', text: name }),
                 select,
             ]));
@@ -356,11 +438,34 @@ function createExtractSection(api, setStatus) {
     function render() {
         const state = api.getExtractUiState();
         syncMode();
+        renderNovelPicker(state);
+        injectNovelCheck.checked = Boolean(state.injectNovel);
         renderProgress(state);
         renderLog(state);
         renderResults(state);
         renderMapping(state);
         updatePlan();
+    }
+
+    function renderNovelPicker(state) {
+        const novels = state.novels ?? [];
+        novelSelect.textContent = '';
+        if (!novels.length) {
+            novelSelect.append(el('option', { value: '', text: '（还没有小说）' }));
+            novelSelect.disabled = true;
+        } else {
+            novelSelect.disabled = false;
+            for (const novel of novels) {
+                novelSelect.append(el('option', {
+                    value: novel.id,
+                    text: `${novel.name}（${novel.results.length} 条）`,
+                }));
+            }
+            novelSelect.value = state.activeId ?? '';
+        }
+        const hasNovel = Boolean(state.novel);
+        renameNovelBtn.disabled = !hasNovel;
+        deleteNovelBtn.disabled = !hasNovel;
     }
 
     syncMode();

@@ -73,16 +73,28 @@ export function normalizeChatState(raw) {
         const entry = normalizeRelation(value);
         if (entry) relations[key] = entry;
     }
+    // 小说名 → 聊天角色的映射是「每聊天」的事：同一部小说用到不同聊天，映射本来就不一样。
+    const novelMapping = {};
+    for (const [novelId, map] of Object.entries(src.novelMapping && typeof src.novelMapping === 'object' ? src.novelMapping : {})) {
+        if (!map || typeof map !== 'object') continue;
+        const clean = {};
+        for (const [name, key] of Object.entries(map)) {
+            const n = str(name).trim();
+            if (!n) continue;
+            clean[n] = key === null || key === undefined || key === '' ? null : String(key);
+        }
+        novelMapping[String(novelId)] = clean;
+    }
     return {
         version: SCHEMA_VERSION,
         relations,
-        extract: normalizeExtractState(src.extract),
+        novelMapping,
         updatedAt: Number(src.updatedAt) || 0,
     };
 }
 
 export function emptyChatState() {
-    return { version: SCHEMA_VERSION, relations: {}, extract: normalizeExtractState(null), updatedAt: 0 };
+    return { version: SCHEMA_VERSION, relations: {}, novelMapping: {}, updatedAt: 0 };
 }
 
 /** 归一化「全局默认」关系库。 */
@@ -125,7 +137,9 @@ export function defaultSettings() {
             maxChunks: EXTRACT_DEFAULTS.maxChunks,
             startOffset: EXTRACT_DEFAULTS.startOffset,
             temperature: 0,
+            injectNovel: false,  // 是否把当前小说的称呼表也注入提示词
         },
+        novels: { version: SCHEMA_VERSION, items: {}, activeId: null },
         library: {},
     };
 }
@@ -153,12 +167,21 @@ export function normalizeSettings(raw) {
     extract.maxChunks = clampInt(extract.maxChunks, 1, 500, base.extract.maxChunks);
     extract.startOffset = clampInt(extract.startOffset, 0, 100000000, base.extract.startOffset);
     extract.temperature = clampNumber(extract.temperature, 0, 2, 0);
+    extract.injectNovel = Boolean(extract.injectNovel);
     custom.baseUrl = str(custom.baseUrl).trim();
     custom.model = str(custom.model).trim();
     custom.apiKey = str(custom.apiKey);
     extract.custom = custom;
 
-    return { ...base, ...src, inject, scan, extract, library: normalizeLibrary(src.library) };
+    return {
+        ...base,
+        ...src,
+        inject,
+        scan,
+        extract,
+        novels: normalizeNovels(src.novels),
+        library: normalizeLibrary(src.library),
+    };
 }
 
 export function clampInt(value, min, max, fallback) {
@@ -611,8 +634,13 @@ export function lintRelations({ messages = [], participants = [], chatState = nu
 }
 
 /* ------------------------------------------------------------------ *
- * 正文提取：切块 → 提示词 → 解析 → 合并 → 名字映射 → 落表
- * 这一整套都不碰网络，模型调用由 extract.js 注入，所以能离线测。
+ * 小说称呼库
+ *
+ * 核心定位：**先建立小说的称呼**，跟当前开着哪个聊天无关。
+ * 所以结果存在全局设置里的「小说库」中，每部小说一份；名字就是小说里的人物名。
+ * 聊天里要用的时候才做一次「名字 → 聊天角色」的映射（映射属于聊天，不存在这儿）。
+ *
+ * 这一整套不碰网络，模型调用由 extract.js 注入，所以能离线测。
  * ------------------------------------------------------------------ */
 
 export const EXTRACT_DEFAULTS = {
@@ -623,35 +651,57 @@ export const EXTRACT_DEFAULTS = {
     maxTokens: 1600,
 };
 
-/** 提取结果的状态。results 里存的是「小说里的人物名」，不是聊天参与者的键。 */
-export function normalizeExtractState(raw) {
+/** 归一化一条提取结果（小说人物名级）。 */
+function normalizeExtractItem(item) {
+    const from = str(item?.from).trim();
+    const to = str(item?.to).trim();
+    const call = str(item?.call).trim();
+    if (!from || !to || !call || from === to) return null;
+    return {
+        from,
+        to,
+        call,
+        count: clampInt(item?.count, 1, 100000, 1),
+        confidence: clampNumber(item?.confidence, 0, 1, 0.7),
+        evidence: (Array.isArray(item?.evidence) ? item.evidence : [item?.evidence])
+            .map(e => str(e).trim())
+            .filter(Boolean)
+            .slice(0, 3),
+    };
+}
+
+export function newNovelId() {
+    return `novel_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+export function createNovel(name = '未命名小说', extra = {}) {
+    const now = Date.now();
+    return normalizeNovel({
+        id: newNovelId(),
+        name: str(name).trim() || '未命名小说',
+        createdAt: now,
+        updatedAt: now,
+        ...extra,
+    });
+}
+
+/** 归一化一部小说。 */
+export function normalizeNovel(raw) {
     const src = raw && typeof raw === 'object' ? raw : {};
     const results = [];
+    const seen = new Set();
     for (const item of Array.isArray(src.results) ? src.results : []) {
-        const from = str(item?.from).trim();
-        const to = str(item?.to).trim();
-        const call = str(item?.call).trim();
-        if (!from || !to || !call || from === to) continue;
-        results.push({
-            from,
-            to,
-            call,
-            count: clampInt(item?.count, 1, 100000, 1),
-            confidence: clampNumber(item?.confidence, 0, 1, 0.7),
-            evidence: (Array.isArray(item?.evidence) ? item.evidence : [item?.evidence])
-                .map(e => str(e).trim())
-                .filter(Boolean)
-                .slice(0, 3),
-        });
-    }
-    const mapping = {};
-    for (const [name, key] of Object.entries(src.mapping && typeof src.mapping === 'object' ? src.mapping : {})) {
-        const n = str(name).trim();
-        if (!n) continue;
-        mapping[n] = key === null || key === undefined || key === '' ? null : String(key);
+        const clean = normalizeExtractItem(item);
+        if (!clean) continue;
+        const key = `${clean.from}=>${clean.to}|${clean.call}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        results.push(clean);
     }
     return {
-        createdAt: Number(src.createdAt) || 0,
+        id: str(src.id).trim() || newNovelId(),
+        name: str(src.name).trim().slice(0, 100) || '未命名小说',
+        createdAt: Number(src.createdAt) || Date.now(),
         updatedAt: Number(src.updatedAt) || 0,
         sourceName: str(src.sourceName).slice(0, 200),
         sourceChars: clampInt(src.sourceChars, 0, 100000000, 0),
@@ -659,9 +709,119 @@ export function normalizeExtractState(raw) {
         chunksTotal: clampInt(src.chunksTotal, 0, 100000, 0),
         nextOffset: clampInt(src.nextOffset, 0, 100000000, 0),
         results,
-        mapping,
         notes: (Array.isArray(src.notes) ? src.notes : []).map(n => str(n)).filter(Boolean).slice(0, 20),
     };
+}
+
+/** 归一化整个小说库。 */
+export function normalizeNovels(raw) {
+    const src = raw && typeof raw === 'object' ? raw : {};
+    const items = {};
+    const source = src.items && typeof src.items === 'object' ? src.items : {};
+    for (const [id, novel] of Object.entries(source)) {
+        const clean = normalizeNovel({ ...novel, id });
+        items[clean.id] = clean;
+    }
+    const activeId = str(src.activeId).trim();
+    return {
+        version: SCHEMA_VERSION,
+        items,
+        activeId: activeId && items[activeId] ? activeId : (Object.keys(items)[0] ?? null),
+    };
+}
+
+export function listNovels(novels) {
+    const clean = normalizeNovels(novels);
+    return Object.values(clean.items).sort((a, b) => b.updatedAt - a.updatedAt || a.name.localeCompare(b.name, 'zh-Hans-CN'));
+}
+
+/**
+ * 把原始的「谁喊谁什么」条目整理成一张称呼表：
+ * 同一对的多个称呼，命中多的当主称呼，其余降为别名。
+ * 这就是用户要的那张「小说称呼表」，纯人名级，不涉及聊天。
+ */
+export function buildNovelTable(results) {
+    const merged = mergeExtractResults([results]);
+    const byPair = new Map();
+    for (const item of merged) {
+        const key = `${item.from}=>${item.to}`;
+        let group = byPair.get(key);
+        if (!group) {
+            group = { from: item.from, to: item.to, calls: [] };
+            byPair.set(key, group);
+        }
+        group.calls.push(item);
+    }
+    const out = [];
+    for (const group of byPair.values()) {
+        group.calls.sort((a, b) => (b.count - a.count) || a.call.localeCompare(b.call, 'zh-Hans-CN'));
+        const main = group.calls[0];
+        out.push({
+            from: group.from,
+            to: group.to,
+            call: main.call,
+            aliases: uniq(group.calls.slice(1).map(c => c.call)).filter(a => a !== main.call),
+            count: main.count,
+            confidence: main.confidence,
+            evidence: main.evidence,
+            variants: group.calls.map(c => ({ call: c.call, count: c.count })),
+        });
+    }
+    return out.sort((a, b) =>
+        b.count - a.count
+        || a.from.localeCompare(b.from, 'zh-Hans-CN')
+        || a.to.localeCompare(b.to, 'zh-Hans-CN')
+        || a.call.localeCompare(b.call, 'zh-Hans-CN'));
+}
+
+/** 称呼表的纯文本形式（Markdown 表格），方便直接粘进世界书或角色卡。 */
+export function novelTableToText(table, { withEvidence = false } = {}) {
+    const rows = Array.isArray(table) ? table : [];
+    if (!rows.length) return '';
+    const head = withEvidence
+        ? '| 称呼方 | 被称呼方 | 称呼 | 别名 | 命中 | 原文证据 |'
+        : '| 称呼方 | 被称呼方 | 称呼 | 别名 | 命中 |';
+    const sep = withEvidence
+        ? '| --- | --- | --- | --- | --- | --- |'
+        : '| --- | --- | --- | --- | --- |';
+    const body = rows.map(row => {
+        const cells = [
+            row.from,
+            row.to,
+            row.call,
+            (row.aliases ?? []).join('、'),
+            String(row.count ?? ''),
+        ];
+        if (withEvidence) {
+            // 表格里不能出现换行和竖线，先把证据洗一遍
+            cells.push(String(row.evidence?.[0] ?? '').replace(/[\r\n|]+/g, ' ').trim());
+        }
+        return `| ${cells.join(' | ')} |`;
+    });
+    return [head, sep, ...body].join('\n');
+}
+
+/** 把一部小说的称呼表压成可注入提示词的一段。 */
+export function composeNovelPromptBlock(novel, { maxChars = 3000, includeAliases = true, header = true } = {}) {
+    const table = buildNovelTable(novel?.results);
+    if (!table.length) return '';
+    const lines = table.map(row => {
+        const extras = includeAliases && row.aliases?.length ? `（别名：${row.aliases.join('、')}）` : '';
+        return `${row.from} → ${row.to}：${row.call}${extras}`;
+    });
+    const head = header
+        ? `【原著称呼表${novel?.name ? `｜${novel.name}` : ''}】以下称呼出自原著，用来提醒人物之间习惯怎么称呼，不要复述本表。`
+        : '';
+    const max = clampInt(maxChars, 200, 100000, 3000);
+    const kept = [];
+    let length = head.length;
+    for (const line of lines) {
+        if (length + line.length + 1 > max) break;
+        kept.push(line);
+        length += line.length + 1;
+    }
+    const dropped = lines.length - kept.length;
+    return [head, ...kept, dropped > 0 ? `（另有 ${dropped} 条因长度限制未列出）` : ''].filter(Boolean).join('\n');
 }
 
 export function clampNumber(value, min, max, fallback) {
@@ -782,7 +942,11 @@ export function parseExtractResponse(raw) {
     return { items, error: null };
 }
 
-/** 合并各块的提取结果：同一条关系只留一行，累加命中块数，保留最多 3 条证据。 */
+/**
+ * 合并提取条目：同一条关系只留一行，累加命中次数，保留最多 3 条证据。
+ * 累加的是条目自带的 count——每块现抽出来的条目没有 count（按 1 算），
+ * 已经落过盘的条目带着之前的命中次数，所以「再整理一次」不会把次数抹平。
+ */
 export function mergeExtractResults(chunkItemLists) {
     const buckets = new Map();
     for (const items of chunkItemLists ?? []) {
@@ -793,7 +957,7 @@ export function mergeExtractResults(chunkItemLists) {
                 bucket = { from: item.from, to: item.to, call: item.call, count: 0, confidence: 0, evidence: [] };
                 buckets.set(key, bucket);
             }
-            bucket.count += 1;
+            bucket.count += Math.max(1, Number(item.count) || 1);
             bucket.confidence = Math.max(bucket.confidence, Number(item.confidence) || 0);
             if (item.evidence && bucket.evidence.length < 3 && !bucket.evidence.includes(item.evidence)) {
                 bucket.evidence.push(item.evidence);
@@ -903,17 +1067,30 @@ export function applyExtractToChatState(chatState, results, mapping) {
  * ------------------------------------------------------------------ */
 
 export function exportBundle({ chatState, library, settings }) {
+    const normalized = normalizeSettings(settings);
     return {
         type: 'st-appellation-manager/bundle',
         version: SCHEMA_VERSION,
         exportedAt: new Date().toISOString(),
         chat: normalizeChatState(chatState),
         library: normalizeLibrary(library),
-        inject: normalizeSettings({ inject: settings?.inject }).inject,
+        inject: normalized.inject,
+        novels: normalized.novels,
     };
 }
 
-/** 解析导入内容；支持完整 bundle，也支持只含 relations 的裸对象。 */
+/** 只导出一部小说（含称呼表），方便单独备份或分享。 */
+export function exportNovel(novel) {
+    const clean = normalizeNovel(novel);
+    return {
+        type: 'st-appellation-manager/novel',
+        version: SCHEMA_VERSION,
+        exportedAt: new Date().toISOString(),
+        novel: { ...clean, table: buildNovelTable(clean.results) },
+    };
+}
+
+/** 解析导入内容；支持完整 bundle、单部小说，也支持只含 relations 的裸对象。 */
 export function importBundle(raw) {
     let data = raw;
     if (typeof raw === 'string') {
@@ -925,9 +1102,14 @@ export function importBundle(raw) {
     }
     if (!data || typeof data !== 'object') throw new Error('导入内容为空或格式不正确');
 
+    if (data.type === 'st-appellation-manager/novel') {
+        return { novel: normalizeNovel(data.novel), chat: null, library: null, inject: null };
+    }
+
     const isBundle = data.type === 'st-appellation-manager/bundle';
     const chat = normalizeChatState(isBundle ? data.chat : data);
     const library = isBundle ? normalizeLibrary(data.library) : {};
     const inject = isBundle && data.inject ? normalizeSettings({ inject: data.inject }).inject : null;
-    return { chat, library, inject };
+    const novels = isBundle && data.novels ? normalizeNovels(data.novels) : null;
+    return { chat, library, inject, novels };
 }

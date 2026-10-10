@@ -12,6 +12,7 @@ import {
     USER_KEY,
     applyExtractToChatState,
     autoMapNames,
+    buildNovelTable,
     buildParticipants,
     buildPatches,
     chunkText,
@@ -19,18 +20,25 @@ import {
     clearRelation,
     collectNames,
     composeInlineTable,
+    composeNovelPromptBlock,
     composePromptBlock,
+    createNovel,
     defaultSettings,
     exportBundle,
+    exportNovel,
     findOrphanRelations,
     focusParticipantKey,
     getRelation,
     importBundle,
     lintRelations,
+    listNovels,
     mergeExtractResults,
+    newNovelId,
     normalizeChatState,
-    normalizeExtractState,
+    normalizeNovel,
+    normalizeNovels,
     normalizeSettings,
+    novelTableToText,
     parseRelationKey,
     patchesToRelations,
     relationKey,
@@ -55,12 +63,13 @@ const boundListeners = [];
 
 /**
  * 提取的运行态。故意只放内存：
- * 正文可能有几百 KB，塞进 chat_metadata 会让每次存聊天都拖着一坨文本。
- * 代价是刷新页面后需要重新粘贴正文（提取出来的结果本身是持久化的）。
+ * 正文可能有几百 KB，塞进设置或聊天元数据会让每次存档都拖着一坨文本。
+ * 代价是刷新页面后需要重新粘正文（提取出来的称呼表本身是持久化的）。
+ * 正文按小说分开存，切换小说不会互相冲掉。
  */
 const extractRuntime = {
-    text: '',
-    sourceName: '',
+    texts: new Map(),        // novelId -> 正文
+    sourceNames: new Map(),  // novelId -> 文件名
     running: false,
     abortRequested: false,
     progress: null,
@@ -130,6 +139,91 @@ function messagesOf() {
 }
 
 /* ------------------------------------------------------------------ *
+ * 小说库
+ *
+ * 「先建立小说的称呼」——结果存在全局设置里，跟当前开着哪个聊天无关。
+ * 聊天里要用的时候才做一次「名字 → 聊天角色」的映射，映射存在聊天里。
+ * ------------------------------------------------------------------ */
+
+function novelsState() {
+    return getSettings().novels;
+}
+
+function activeNovelId() {
+    return novelsState().activeId ?? null;
+}
+
+function activeNovel() {
+    const store = novelsState();
+    return store.activeId ? (store.items[store.activeId] ?? null) : null;
+}
+
+/** 取当前小说的正文（只读内存）。 */
+function activeText() {
+    const id = activeNovelId();
+    return id ? (extractRuntime.texts.get(id) ?? '') : '';
+}
+
+function setActiveText(text, sourceName = '') {
+    const id = activeNovelId();
+    if (!id) return;
+    extractRuntime.texts.set(id, String(text ?? ''));
+    if (sourceName) extractRuntime.sourceNames.set(id, String(sourceName).slice(0, 200));
+}
+
+/** 直接替换小说库里的一部小说，并落盘。 */
+function writeNovel(novel) {
+    const settings = getSettings();
+    const store = normalizeNovels(settings.novels);
+    const clean = normalizeNovel({ ...novel, updatedAt: Date.now() });
+    store.items[clean.id] = clean;
+    if (!store.activeId) store.activeId = clean.id;
+    settings.novels = store;
+    saveSettings();
+    return clean;
+}
+
+function removeNovel(id) {
+    const settings = getSettings();
+    const store = normalizeNovels(settings.novels);
+    delete store.items[id];
+    store.activeId = store.activeId === id ? (Object.keys(store.items)[0] ?? null) : store.activeId;
+    settings.novels = store;
+    saveSettings();
+    extractRuntime.texts.delete(id);
+    extractRuntime.sourceNames.delete(id);
+}
+
+/** 当前聊天里，这部小说的「人名 → 角色键」映射。 */
+function chatMapping(novelId) {
+    if (!novelId) return {};
+    return readChatState().novelMapping?.[novelId] ?? {};
+}
+
+function writeChatMapping(novelId, name, key) {
+    if (!novelId) return;
+    const state = readChatState();
+    const forNovel = { ...(state.novelMapping?.[novelId] ?? {}), [name]: key || null };
+    writeChatState({ ...state, novelMapping: { ...state.novelMapping, [novelId]: forNovel } });
+}
+
+/**
+ * 这部小说在当前聊天里的实际映射 = 同名自动对上的 + 用户手动改过的。
+ * 手动值优先，所以自动匹配只是「默认值」，用户改一次就一直记住。
+ */
+function effectiveMapping(novel) {
+    if (!novel) return {};
+    const names = collectNames(novel.results);
+    const manual = chatMapping(novel.id);
+    const auto = autoMapNames(names, participantsOf());
+    const out = {};
+    for (const name of names) {
+        out[name] = Object.prototype.hasOwnProperty.call(manual, name) ? manual[name] : (auto[name] ?? null);
+    }
+    return out;
+}
+
+/* ------------------------------------------------------------------ *
  * 提示词注入
  * ------------------------------------------------------------------ */
 
@@ -150,6 +244,13 @@ function refreshInjection() {
             opts: inject,
             focusKey: focusParticipantKey(participants, ctx.name2),
         });
+    }
+
+    // 可选：把当前这部小说的原著称呼表也带上（人名级，不依赖聊天里有谁）。
+    if (inject.enabled && settings.extract.injectNovel && text.length < inject.maxChars) {
+        const novel = activeNovel();
+        const novelBlock = novel ? composeNovelPromptBlock(novel, { maxChars: inject.maxChars - text.length }) : '';
+        if (novelBlock) text = text ? `${text}\n\n${novelBlock}` : novelBlock;
     }
 
     try {
@@ -272,25 +373,32 @@ const api = {
 
     /* ---------------- 正文提取 ---------------- */
 
+    /* ---------------- 小说库与正文提取 ---------------- */
+
     getExtractUiState() {
-        const extract = readChatState().extract;
+        const settings = getSettings();
+        const novel = activeNovel();
+        const novelId = novel?.id ?? null;
         return {
-            extract,
-            names: collectNames(extract.results),
+            novels: listNovels(settings.novels),
+            activeId: novelId,
+            novel,
+            table: buildNovelTable(novel?.results ?? []),
             participants: participantsOf(),
+            mapping: effectiveMapping(novel),
             running: extractRuntime.running,
             progress: extractRuntime.progress,
             log: extractRuntime.log.slice(-12),
-            textChars: extractRuntime.text.length,
-            sourceName: extractRuntime.sourceName,
+            textChars: activeText().length,
+            sourceName: extractRuntime.sourceNames.get(novelId) ?? '',
+            injectNovel: Boolean(settings.extract.injectNovel),
         };
     },
     getExtractText() {
-        return extractRuntime.text;
+        return activeText();
     },
     setExtractText(text, sourceName = '') {
-        extractRuntime.text = String(text ?? '');
-        if (sourceName) extractRuntime.sourceName = String(sourceName).slice(0, 200);
+        setActiveText(text, sourceName);
     },
     getExtractSettings() {
         return getSettings().extract;
@@ -298,7 +406,7 @@ const api = {
     /** 开跑前先算清代价：要发几次请求、处理正文的哪一段。 */
     planExtract() {
         const extract = getSettings().extract;
-        const text = extractRuntime.text;
+        const text = activeText();
         const chunks = chunkText(text, {
             chunkChars: extract.chunkChars,
             maxChunks: extract.maxChunks,
@@ -318,16 +426,109 @@ const api = {
         const settings = getSettings();
         settings.extract = { ...settings.extract, [key]: value };
         saveSettings();
+        refreshInjection();
     },
     setExtractCustom(key, value) {
         const settings = getSettings();
         settings.extract.custom = { ...settings.extract.custom, [key]: value };
         saveSettings();
     },
+
+    /* ---------------- 小说管理 ---------------- */
+
+    /** 新建一部小说并切过去。 */
+    createNovel(name) {
+        const settings = getSettings();
+        const store = normalizeNovels(settings.novels);
+        const novel = createNovel(name || `小说 ${Object.keys(store.items).length + 1}`);
+        store.items[novel.id] = novel;
+        store.activeId = novel.id;
+        settings.novels = store;
+        saveSettings();
+        extractRuntime.log = [];
+        return novel;
+    },
+    setActiveNovel(id) {
+        const settings = getSettings();
+        const store = normalizeNovels(settings.novels);
+        if (!store.items[id]) return false;
+        store.activeId = id;
+        settings.novels = store;
+        saveSettings();
+        extractRuntime.log = [];
+        extractRuntime.progress = null;
+        return true;
+    },
+    renameNovel(id, name) {
+        const store = novelsState();
+        const novel = store.items[id];
+        if (!novel) return false;
+        writeNovel({ ...novel, name: String(name ?? '').trim() || novel.name });
+        return true;
+    },
+    deleteNovel(id) {
+        if (!novelsState().items[id]) return false;
+        removeNovel(id);
+        return true;
+    },
+    setNovelInject(enabled) {
+        const settings = getSettings();
+        settings.extract = { ...settings.extract, injectNovel: Boolean(enabled) };
+        saveSettings();
+        refreshInjection();
+    },
+    getNovelTableText(options) {
+        const novel = activeNovel();
+        if (!novel) return '';
+        return novelTableToText(buildNovelTable(novel.results), options);
+    },
+    exportNovelFile() {
+        const novel = activeNovel();
+        if (!novel) {
+            panel?.setStatus('还没有小说可以导出');
+            return;
+        }
+        downloadJson(exportNovel(novel), `novel-${safeFileName(novel.name)}.json`);
+        panel?.setStatus(`已导出《${novel.name}》的称呼表`);
+    },
+    importNovelFile() {
+        pickJsonFile(async text => {
+            const result = importBundle(text);
+            if (!result.novel) throw new Error('这个文件里没有小说数据');
+            const settings = getSettings();
+            const store = normalizeNovels(settings.novels);
+            // 导入的新小说换一个 id，避免覆盖同名小说
+            const incoming = { ...result.novel, id: newNovelId() };
+            store.items[incoming.id] = incoming;
+            store.activeId = incoming.id;
+            settings.novels = store;
+            saveSettings();
+            panel?.render();
+            panel?.setStatus(`已导入《${incoming.name}》，${incoming.results.length} 条原始称呼`);
+        });
+    },
+    /** 把称呼表以 Markdown 表格复制到剪贴板。 */
+    async copyNovelTable() {
+        const text = api.getNovelTableText({ withEvidence: false });
+        if (!text) {
+            panel?.setStatus('当前小说还没有称呼表');
+            return false;
+        }
+        try {
+            await navigator.clipboard.writeText(text);
+            panel?.setStatus('称呼表已复制到剪贴板，可以直接粘进世界书或角色卡');
+            return true;
+        } catch (error) {
+            console.warn(LOG_PREFIX, '复制失败', error);
+            panel?.setStatus('浏览器不让直接写剪贴板，用「导出 JSON」或手动选中表格复制');
+            return false;
+        }
+    },
+
+    /* ---------------- 应用到当前聊天 ---------------- */
+
     setMapping(name, key) {
-        const state = readChatState();
-        state.extract.mapping = { ...state.extract.mapping, [name]: key || null };
-        writeChatState({ ...state, extract: normalizeExtractState(state.extract) });
+        writeChatMapping(activeNovelId(), name, key);
     },
     abortExtract() {
         if (!extractRuntime.running) return;
@@ -347,7 +548,12 @@ const api = {
         if (!ctx) return { started: false, reason: '取不到酒馆上下文' };
 
         const extract = getSettings().extract;
-        const text = extractRuntime.text;
+        if (!activeNovel()) {
+            // 没有小说就直接建一部，省掉「先点新建」这一步。
+            const created = api.createNovel(deriveNovelName());
+            panel?.setStatus(`已新建《${created.name}》`);
+        }
+        const text = activeText();
         if (!text.trim()) return { started: false, reason: '先粘贴正文或导入 txt 文件' };
 
         const plan = api.planExtract();
@@ -405,67 +611,58 @@ const api = {
 
         extractRuntime.running = false;
 
-        // 新结果和上一次的结果合并（同一部小说分几次跑时不会互相覆盖）。
-        const state = readChatState();
-        const merged = mergeExtractResults([state.extract.results, outcome.results]);
-        const names = collectNames(merged);
-        const autoMapping = autoMapNames(names, participantsOf());
-        const mapping = {};
-        for (const name of names) {
-            // 人工改过的映射优先保留，其次用自动匹配的结果。
-            mapping[name] = Object.prototype.hasOwnProperty.call(state.extract.mapping, name)
-                ? state.extract.mapping[name]
-                : (autoMapping[name] ?? null);
-        }
-
-        writeChatState({
-            ...state,
-            extract: normalizeExtractState({
-                createdAt: state.extract.createdAt || Date.now(),
-                updatedAt: Date.now(),
-                sourceName: extractRuntime.sourceName || state.extract.sourceName,
-                sourceChars: text.length,
-                chunksDone: extractRuntime.progress?.done ?? 0,
-                chunksTotal: outcome.chunks,
-                nextOffset: outcome.nextOffset,
-                results: merged,
-                mapping,
-                notes: outcome.failures.slice(0, 5).map(f => `第 ${f.index + 1} 块失败：${f.error}`),
-            }),
+        // 新结果并进这部小说已有的结果里（分几次跑完整本书时不会互相覆盖）。
+        const novel = activeNovel();
+        const merged = mergeExtractResults([novel?.results ?? [], outcome.results]);
+        const saved = writeNovel({
+            ...(novel ?? {}),
+            sourceName: extractRuntime.sourceNames.get(novel?.id) ?? novel?.sourceName ?? '',
+            sourceChars: text.length,
+            chunksDone: extractRuntime.progress?.done ?? 0,
+            chunksTotal: outcome.chunks,
+            nextOffset: outcome.nextOffset,
+            results: merged,
+            notes: outcome.failures.slice(0, 5).map(f => `第 ${f.index + 1} 块失败：${f.error}`),
         });
 
-        const mapped = names.filter(n => mapping[n]).length;
-        logExtract(`本轮结束：${outcome.results.length} 条新关系，合并后 ${merged.length} 条，名字映射上 ${mapped}/${names.length} 个`);
+        const table = buildNovelTable(saved.results);
+        const names = collectNames(saved.results);
+        logExtract(`本轮结束：新增 ${outcome.results.length} 条，合计 ${merged.length} 条原始称呼，整理成 ${table.length} 对关系的称呼表`);
         panel?.render();
         return {
             started: true,
             results: merged.length,
-            mapped,
+            pairs: table.length,
             names: names.length,
             failures: outcome.failures.length,
             aborted: outcome.aborted,
             stoppedEarly: outcome.stoppedEarly,
             nextOffset: outcome.nextOffset,
+            novelName: saved.name,
         };
     },
 
-    /** 把已映射的提取结果写成称呼关系。原来手填的关系会被同键覆盖，其余保留。 */
+    /** 把当前小说里已映射上的称呼写进本聊天的关系表。原来手填的关系会被同键覆盖，其余保留。 */
     applyExtract() {
+        const novel = activeNovel();
+        if (!novel?.results.length) return { applied: 0, unmapped: [] };
+        const mapping = effectiveMapping(novel);
         const state = readChatState();
-        const extract = state.extract;
-        if (!extract.results.length) return { applied: 0, unmapped: [] };
-        const unmapped = collectNames(extract.results).filter(n => !extract.mapping[n]);
-        const next = applyExtractToChatState(state, extract.results, extract.mapping);
+        const unmapped = collectNames(novel.results).filter(n => !mapping[n]);
+        const next = applyExtractToChatState(state, novel.results, mapping);
         writeChatState(next);
         refreshInjection();
-        return { applied: patchesToRelations(buildPatches(extract.results, extract.mapping)).length, unmapped };
+        return {
+            applied: patchesToRelations(buildPatches(novel.results, mapping)).length,
+            unmapped,
+        };
     },
 
-    /** 把这批结果存进全局默认库，换到别的聊天也能用。 */
+    /** 把当前小说的称呼表存进全局默认库，别的聊天不用再映射也能用。 */
     saveExtractToLibrary() {
-        const state = readChatState();
-        const extract = state.extract;
-        const relations = patchesToRelations(buildPatches(extract.results, extract.mapping));
+        const novel = activeNovel();
+        if (!novel?.results.length) return 0;
+        const relations = patchesToRelations(buildPatches(novel.results, effectiveMapping(novel)));
         if (!relations.length) return 0;
         const settings = getSettings();
         const library = { ...settings.library };
@@ -483,12 +680,58 @@ const api = {
         return relations.length;
     },
 
+    /** 清空当前小说的提取结果（保留小说条目本身）。 */
     clearExtract() {
-        const state = readChatState();
-        writeChatState({ ...state, extract: normalizeExtractState(null) });
+        const novel = activeNovel();
+        if (!novel) return;
+        writeNovel({ ...novel, results: [], chunksDone: 0, chunksTotal: 0, nextOffset: 0, notes: [] });
         panel?.render();
     },
 };
+
+/* ------------------------------------------------------------------ *
+ * 小工具
+ * ------------------------------------------------------------------ */
+
+/** 新建小说时给个有信息量的默认名，省得用户对着一串「未命名」发呆。 */
+function deriveNovelName() {
+    const name = extractRuntime.sourceNames.get(activeNovelId());
+    if (name) return String(name).replace(/\.[^.]+$/, '').slice(0, 60);
+    return `小说 ${new Date().toLocaleDateString('zh-CN')}`;
+}
+
+function safeFileName(name) {
+    return String(name ?? 'novel').replace(/[\\/:*?"<>|]+/g, '_').slice(0, 60) || 'novel';
+}
+
+function downloadJson(data, fileName) {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = fileName;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+function pickJsonFile(onText) {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json,application/json';
+    input.addEventListener('change', async () => {
+        const file = input.files?.[0];
+        if (!file) return;
+        try {
+            await onText(await file.text());
+        } catch (error) {
+            console.error(LOG_PREFIX, '导入失败', error);
+            panel?.setStatus(`导入失败：${error.message}`);
+        }
+    });
+    input.click();
+}
 
 /** 提取日志只留最近 200 行，够回溯就行。 */
 function logExtract(line) {

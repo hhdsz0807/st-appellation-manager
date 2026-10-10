@@ -431,15 +431,6 @@ check('一条命令把提取结果写进称呼关系表', () => {
     assertEqual(mod.getRelation(next, BAILU, XINGYE).call, '小星星');
     assertEqual(mod.getRelation(next, XINGYE, USER_KEY).call, '陆哥');
 });
-check('提取结果能随聊天一起导出导入', () => {
-    const results = mod.mergeExtractResults([chunkB]);
-    const state = mod.applyExtractToChatState(mod.emptyChatState(), results, { 白鹭: BAILU, 星野: XINGYE });
-    state.extract = mod.normalizeExtractState({ ...state.extract, results, mapping: { 白鹭: BAILU, 星野: XINGYE } });
-    const bundle = mod.exportBundle({ chatState: state, library: {}, settings: mod.defaultSettings() });
-    const back = mod.importBundle(JSON.stringify(bundle));
-    assertEqual(back.chat.extract.results.length, results.length);
-    assertEqual(back.chat.extract.mapping['白鹭'], BAILU);
-});
 check('提取设置也能被夹到合法范围', () => {
     const s = mod.normalizeSettings({ extract: { mode: '乱写', chunkChars: 5, maxChunks: 9999, temperature: 9, custom: { baseUrl: '  x  ' } } });
     assertEqual(s.extract.mode, 'st');
@@ -447,6 +438,133 @@ check('提取设置也能被夹到合法范围', () => {
     assertEqual(s.extract.maxChunks, 500);
     assertEqual(s.extract.temperature, 2);
     assertEqual(s.extract.custom.baseUrl, 'x');
+});
+
+/* ---------------- 小说称呼库 ---------------- */
+
+console.log('\n小说称呼库');
+
+const NOVEL_RESULTS = [
+    { from: '白鹭', to: '星野', call: '小星星', evidence: 'e1', confidence: 0.9, count: 5 },
+    { from: '白鹭', to: '星野', call: '星星', evidence: 'e2', confidence: 0.7, count: 2 },
+    { from: '星野', to: '小陆', call: '陆哥', evidence: 'e3', confidence: 0.95, count: 8 },
+];
+
+check('新建小说拿到唯一 id 和默认名', () => {
+    const a = mod.createNovel('白鹭传');
+    const b = mod.createNovel();
+    assertEqual(a.name, '白鹭传');
+    assert(a.id !== b.id, 'id 不能重复');
+    assertEqual(a.results, []);
+});
+check('归一化会丢掉重复条目和空条目', () => {
+    const novel = mod.normalizeNovel({
+        name: '测试',
+        results: [...NOVEL_RESULTS, NOVEL_RESULTS[0], { from: 'A', to: 'B', call: '' }, { from: 'C', to: 'C', call: '自己' }],
+    });
+    assertEqual(novel.results.length, 3, '重复的和空的都该去掉');
+});
+check('小说库归一化：activeId 指向不存在的小说时自动落到第一部', () => {
+    const one = mod.createNovel('一');
+    const store = mod.normalizeNovels({ items: { [one.id]: one }, activeId: '不存在的id' });
+    assertEqual(store.activeId, one.id);
+});
+check('空库的 activeId 是 null', () => {
+    assertEqual(mod.normalizeNovels(null).activeId, null);
+});
+check('列小说按更新时间倒序', () => {
+    const one = mod.normalizeNovel({ id: 'a', name: '旧', updatedAt: 100 });
+    const two = mod.normalizeNovel({ id: 'b', name: '新', updatedAt: 200 });
+    assertEqual(mod.listNovels({ items: { a: one, b: two } }).map(n => n.name), ['新', '旧']);
+});
+
+check('称呼表：同对的多个称呼，命中多的当主称呼，其余是别名', () => {
+    const table = mod.buildNovelTable(NOVEL_RESULTS);
+    const pair = table.find(r => r.from === '白鹭' && r.to === '星野');
+    assertEqual(pair.call, '小星星');
+    assertEqual(pair.aliases, ['星星']);
+    assertEqual(pair.count, 5);
+    assertEqual(pair.variants.map(v => v.call), ['小星星', '星星']);
+});
+check('称呼表按命中次数排序，最常用的排最前', () => {
+    const table = mod.buildNovelTable(NOVEL_RESULTS);
+    assertEqual(table[0].call, '陆哥', '命中 8 次的该排第一');
+});
+check('称呼表不依赖聊天参与者（小说里没有的角色照样在表里）', () => {
+    const table = mod.buildNovelTable([{ from: '路人甲', to: '路人乙', call: '老乙', count: 1, confidence: 0.8 }]);
+    assertEqual(table.length, 1);
+    assertEqual(table[0].from, '路人甲');
+});
+check('称呼表能转成可粘贴的 Markdown 表格', () => {
+    const text = mod.novelTableToText(mod.buildNovelTable(NOVEL_RESULTS));
+    const lines = text.split('\n');
+    assertEqual(lines.length, 4, `表头 + 分隔 + 2 对关系，实际 ${lines.length}`);
+    assertIncludes(lines[0], '| 称呼方 | 被称呼方 | 称呼 | 别名 | 命中 |');
+    assertIncludes(text, '| 白鹭 | 星野 | 小星星 | 星星 | 5 |');
+});
+check('证据带换行和竖线时不会撑坏表格', () => {
+    const text = mod.novelTableToText(
+        mod.buildNovelTable([{ from: 'A', to: 'B', call: '老弟', count: 1, evidence: '第一行\n第二行|带竖线' }]),
+        { withEvidence: true },
+    );
+    assertEqual(text.split('\n').length, 3, '证据里的换行必须被洗掉');
+    assertIncludes(text, '第一行 第二行 带竖线');
+});
+check('空表转出空串，不产出半个表格', () => {
+    assertEqual(mod.novelTableToText([]), '');
+});
+check('原著称呼表能压成提示词片段，并在超长时说明', () => {
+    const novel = mod.normalizeNovel({ name: '白鹭传', results: NOVEL_RESULTS });
+    const block = mod.composeNovelPromptBlock(novel, { maxChars: 3000 });
+    assertIncludes(block, '白鹭传');
+    assertIncludes(block, '白鹭 → 星野：小星星（别名：星星）');
+    // maxChars 的下限是 200，所以要超长得靠表本身够大
+    const big = mod.normalizeNovel({
+        name: '长篇',
+        results: Array.from({ length: 40 }, (_, i) => ({ from: `甲${i}`, to: `乙${i}`, call: `称呼${i}`, count: 1 })),
+    });
+    const tiny = mod.composeNovelPromptBlock(big, { maxChars: 200 });
+    assertIncludes(tiny, '因长度限制未列出');
+    assert(tiny.length <= 200 + 40, `截断后应接近上限，实际 ${tiny.length}`);
+});
+check('没有称呼的小说压出空串（不注入空内容）', () => {
+    assertEqual(mod.composeNovelPromptBlock(mod.createNovel('空'), {}), '');
+});
+check('单部小说能单独导出再导入', () => {
+    const novel = mod.normalizeNovel({ name: '白鹭传', results: NOVEL_RESULTS });
+    const bundle = mod.exportNovel(novel);
+    assertEqual(bundle.type, 'st-appellation-manager/novel');
+    assertEqual(bundle.novel.table.length, 2, '导出时附上整理好的称呼表');
+    const back = mod.importBundle(JSON.stringify(bundle));
+    assertEqual(back.novel.name, '白鹭传');
+    assertEqual(back.novel.results.length, 3);
+    assertEqual(back.chat, null, '单部小说导入不该顺手造一个聊天状态');
+});
+check('小说库能随完整 bundle 一起备份还原', () => {
+    const novel = mod.normalizeNovel({ name: '白鹭传', results: NOVEL_RESULTS });
+    const settings = mod.normalizeSettings({ novels: { items: { [novel.id]: novel }, activeId: novel.id } });
+    const bundle = mod.exportBundle({ chatState: mod.emptyChatState(), library: {}, settings });
+    const back = mod.importBundle(JSON.stringify(bundle));
+    assertEqual(Object.keys(back.novels.items).length, 1);
+    assertEqual(back.novels.activeId, novel.id);
+    assertEqual(back.novels.items[novel.id].results.length, 3);
+});
+
+check('映射存在聊天里，且能随聊天导出导入', () => {
+    const state = mod.normalizeChatState({ novelMapping: { novel_1: { 白鹭: BAILU, 我: null, '': 'x' } } });
+    assertEqual(state.novelMapping.novel_1['白鹭'], BAILU);
+    assertEqual(state.novelMapping.novel_1['我'], null);
+    assert(!('' in state.novelMapping.novel_1), '空名字该被丢掉');
+    const bundle = mod.exportBundle({ chatState: state, library: {}, settings: mod.defaultSettings() });
+    const back = mod.importBundle(JSON.stringify(bundle));
+    assertEqual(back.chat.novelMapping.novel_1['白鹭'], BAILU);
+});
+check('同一部小说用到不同聊天时，映射各自独立（不串味）', () => {
+    const novel = mod.normalizeNovel({ name: '白鹭传', results: NOVEL_RESULTS });
+    const chatA = mod.normalizeChatState({ novelMapping: { [novel.id]: { 白鹭: BAILU } } });
+    const chatB = mod.normalizeChatState({});
+    assertEqual(chatA.novelMapping[novel.id]['白鹭'], BAILU);
+    assertEqual(chatB.novelMapping[novel.id], undefined);
 });
 
 /* ---------------- 汇总 ---------------- */

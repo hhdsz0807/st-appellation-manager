@@ -76,12 +76,13 @@ export function normalizeChatState(raw) {
     return {
         version: SCHEMA_VERSION,
         relations,
+        extract: normalizeExtractState(src.extract),
         updatedAt: Number(src.updatedAt) || 0,
     };
 }
 
 export function emptyChatState() {
-    return { version: SCHEMA_VERSION, relations: {}, updatedAt: 0 };
+    return { version: SCHEMA_VERSION, relations: {}, extract: normalizeExtractState(null), updatedAt: 0 };
 }
 
 /** 归一化「全局默认」关系库。 */
@@ -117,6 +118,14 @@ export function defaultSettings() {
             limit: 40,
             minCount: 1,
         },
+        extract: {
+            mode: 'st',          // st=用酒馆当前连接 | custom=直连自定义 OpenAI 兼容端点
+            custom: { baseUrl: '', model: '', apiKey: '' },
+            chunkChars: EXTRACT_DEFAULTS.chunkChars,
+            maxChunks: EXTRACT_DEFAULTS.maxChunks,
+            startOffset: EXTRACT_DEFAULTS.startOffset,
+            temperature: 0,
+        },
         library: {},
     };
 }
@@ -127,14 +136,29 @@ export function normalizeSettings(raw) {
     const src = raw && typeof raw === 'object' ? raw : {};
     const inject = { ...base.inject, ...(src.inject && typeof src.inject === 'object' ? src.inject : {}) };
     const scan = { ...base.scan, ...(src.scan && typeof src.scan === 'object' ? src.scan : {}) };
+    const extract = { ...base.extract, ...(src.extract && typeof src.extract === 'object' ? src.extract : {}) };
+    const custom = { ...base.extract.custom, ...(extract.custom && typeof extract.custom === 'object' ? extract.custom : {}) };
+
     inject.depth = clampInt(inject.depth, 0, 10000, base.inject.depth);
     inject.position = [0, 1, 2].includes(Number(inject.position)) ? Number(inject.position) : base.inject.position;
     inject.role = [0, 1, 2].includes(Number(inject.role)) ? Number(inject.role) : base.inject.role;
     inject.maxChars = clampInt(inject.maxChars, 200, 100000, base.inject.maxChars);
     inject.targets = ['all', 'user', 'focus'].includes(inject.targets) ? inject.targets : 'all';
+
     scan.limit = clampInt(scan.limit, 1, 500, base.scan.limit);
     scan.minCount = clampInt(scan.minCount, 1, 100, base.scan.minCount);
-    return { ...base, ...src, inject, scan, library: normalizeLibrary(src.library) };
+
+    extract.mode = ['st', 'custom'].includes(extract.mode) ? extract.mode : 'st';
+    extract.chunkChars = clampInt(extract.chunkChars, 200, 20000, base.extract.chunkChars);
+    extract.maxChunks = clampInt(extract.maxChunks, 1, 500, base.extract.maxChunks);
+    extract.startOffset = clampInt(extract.startOffset, 0, 100000000, base.extract.startOffset);
+    extract.temperature = clampNumber(extract.temperature, 0, 2, 0);
+    custom.baseUrl = str(custom.baseUrl).trim();
+    custom.model = str(custom.model).trim();
+    custom.apiKey = str(custom.apiKey);
+    extract.custom = custom;
+
+    return { ...base, ...src, inject, scan, extract, library: normalizeLibrary(src.library) };
 }
 
 export function clampInt(value, min, max, fallback) {
@@ -584,6 +608,294 @@ export function lintRelations({ messages = [], participants = [], chatState = nu
     }
 
     return issues;
+}
+
+/* ------------------------------------------------------------------ *
+ * 正文提取：切块 → 提示词 → 解析 → 合并 → 名字映射 → 落表
+ * 这一整套都不碰网络，模型调用由 extract.js 注入，所以能离线测。
+ * ------------------------------------------------------------------ */
+
+export const EXTRACT_DEFAULTS = {
+    chunkChars: 1500,
+    overlapChars: 120,
+    maxChunks: 12,
+    startOffset: 0,
+    maxTokens: 1600,
+};
+
+/** 提取结果的状态。results 里存的是「小说里的人物名」，不是聊天参与者的键。 */
+export function normalizeExtractState(raw) {
+    const src = raw && typeof raw === 'object' ? raw : {};
+    const results = [];
+    for (const item of Array.isArray(src.results) ? src.results : []) {
+        const from = str(item?.from).trim();
+        const to = str(item?.to).trim();
+        const call = str(item?.call).trim();
+        if (!from || !to || !call || from === to) continue;
+        results.push({
+            from,
+            to,
+            call,
+            count: clampInt(item?.count, 1, 100000, 1),
+            confidence: clampNumber(item?.confidence, 0, 1, 0.7),
+            evidence: (Array.isArray(item?.evidence) ? item.evidence : [item?.evidence])
+                .map(e => str(e).trim())
+                .filter(Boolean)
+                .slice(0, 3),
+        });
+    }
+    const mapping = {};
+    for (const [name, key] of Object.entries(src.mapping && typeof src.mapping === 'object' ? src.mapping : {})) {
+        const n = str(name).trim();
+        if (!n) continue;
+        mapping[n] = key === null || key === undefined || key === '' ? null : String(key);
+    }
+    return {
+        createdAt: Number(src.createdAt) || 0,
+        updatedAt: Number(src.updatedAt) || 0,
+        sourceName: str(src.sourceName).slice(0, 200),
+        sourceChars: clampInt(src.sourceChars, 0, 100000000, 0),
+        chunksDone: clampInt(src.chunksDone, 0, 100000, 0),
+        chunksTotal: clampInt(src.chunksTotal, 0, 100000, 0),
+        nextOffset: clampInt(src.nextOffset, 0, 100000000, 0),
+        results,
+        mapping,
+        notes: (Array.isArray(src.notes) ? src.notes : []).map(n => str(n)).filter(Boolean).slice(0, 20),
+    };
+}
+
+export function clampNumber(value, min, max, fallback) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.min(max, Math.max(min, n));
+}
+
+/**
+ * 把长正文切成块。块之间留一小段重叠，避免「跨块的称呼」正好被切断。
+ * 返回 [{ index, start, end, text }]。
+ */
+export function chunkText(text, opts = {}) {
+    const src = str(text);
+    const size = clampInt(opts.chunkChars, 200, 20000, EXTRACT_DEFAULTS.chunkChars);
+    const overlap = clampInt(opts.overlapChars, 0, size - 1, Math.min(EXTRACT_DEFAULTS.overlapChars, size - 1));
+    const limit = clampInt(opts.maxChunks, 1, 500, EXTRACT_DEFAULTS.maxChunks);
+    const start = clampInt(opts.startOffset, 0, Math.max(0, src.length), 0);
+
+    const chunks = [];
+    let pos = start;
+    while (pos < src.length && chunks.length < limit) {
+        const end = Math.min(src.length, pos + size);
+        chunks.push({ index: chunks.length, start: pos, end, text: src.slice(pos, end) });
+        if (end >= src.length) break;
+        const next = end - overlap;
+        pos = next > pos ? next : end;
+    }
+    return chunks;
+}
+
+export function extractSystemPrompt() {
+    return [
+        '你是信息抽取器。唯一任务：从给定的中文小说片段里，找出「谁称呼谁、用什么称呼」，然后只输出 JSON。',
+        '',
+        '输出格式（严格照做，不要任何解释文字，不要 markdown 代码块）：',
+        '{"appellations":[{"from":"称呼发出者","to":"被称呼者","call":"称呼原文","evidence":"原文里出现这个称呼的那一小句","confidence":0.9}]}',
+        '',
+        '规则：',
+        '1. from / to 只能填片段里真实出现的人物名字；第一人称就写「我」，不要替换成人名。',
+        '2. call 必须是片段里逐字出现过的称呼。不允许改写，不允许把普通名词、动词、语气词当称呼。',
+        '3. 人物真名本身不算称呼。只有昵称、称谓、绰号、代称才算（例如「陆哥」「小星星」「白鹭姐」「师傅」）。',
+        '4. confidence 填 0 到 1。拿不准的宁可不输出——少而准远好过多而错。',
+        '5. evidence 抄原文，不要自己造句。',
+        '6. 没有任何称呼就输出 {"appellations":[]}。除了这个 JSON，什么都不要输出。',
+    ].join('\n');
+}
+
+export function extractUserPrompt(chunk, index, total) {
+    return [
+        `【正文片段 第 ${index + 1} / ${total} 块】`,
+        '<<<',
+        str(chunk?.text ?? '').trim(),
+        '>>>',
+        '',
+        '按系统提示的格式输出 JSON。',
+    ].join('\n');
+}
+
+function tryParseJson(text) {
+    try {
+        const data = JSON.parse(text);
+        return data && typeof data === 'object' ? data : null;
+    } catch {
+        return null;
+    }
+}
+
+/** 从一堆文本里挖出最外层 JSON（对付模型多写的寒暄或 ``` 围栏）。 */
+function extractJsonSlice(text) {
+    const s = str(text).replace(/^\s*```(?:json)?/i, '').replace(/```\s*$/i, '');
+    const firstBrace = s.indexOf('{');
+    const lastBrace = s.lastIndexOf('}');
+    if (firstBrace >= 0 && lastBrace > firstBrace) return s.slice(firstBrace, lastBrace + 1);
+    const firstBracket = s.indexOf('[');
+    const lastBracket = s.lastIndexOf(']');
+    if (firstBracket >= 0 && lastBracket > firstBracket) return s.slice(firstBracket, lastBracket + 1);
+    return null;
+}
+
+/**
+ * 解析模型返回的提取结果。
+ * 返回 { items, error }：error 非空时 items 一定为空，调用方据此记账。
+ */
+export function parseExtractResponse(raw) {
+    const text = str(raw).trim();
+    if (!text) return { items: [], error: '模型返回了空内容' };
+
+    let data = tryParseJson(text);
+    if (!data) {
+        const slice = extractJsonSlice(text);
+        if (slice) data = tryParseJson(slice);
+    }
+    if (!data) return { items: [], error: '返回内容不是可解析的 JSON' };
+
+    const list = Array.isArray(data)
+        ? data
+        : [data.appellations, data.items, data.results, data.data].find(Array.isArray);
+    if (!list) return { items: [], error: 'JSON 里找不到 appellations 数组' };
+
+    const items = [];
+    for (const entry of list) {
+        const from = str(entry?.from).trim();
+        const to = str(entry?.to).trim();
+        const call = str(entry?.call).trim();
+        if (!from || !to || !call) continue;
+        if (from === to) continue;
+        if (from.length > 30 || to.length > 30 || call.length > 30) continue;
+        if (/^[\s\p{P}]+$/u.test(call)) continue;
+        items.push({
+            from,
+            to,
+            call,
+            evidence: str(entry?.evidence).trim().slice(0, 160),
+            confidence: clampNumber(entry?.confidence, 0, 1, 0.7),
+        });
+    }
+    return { items, error: null };
+}
+
+/** 合并各块的提取结果：同一条关系只留一行，累加命中块数，保留最多 3 条证据。 */
+export function mergeExtractResults(chunkItemLists) {
+    const buckets = new Map();
+    for (const items of chunkItemLists ?? []) {
+        for (const item of items ?? []) {
+            const key = `${item.from}=>${item.to}|${item.call}`;
+            let bucket = buckets.get(key);
+            if (!bucket) {
+                bucket = { from: item.from, to: item.to, call: item.call, count: 0, confidence: 0, evidence: [] };
+                buckets.set(key, bucket);
+            }
+            bucket.count += 1;
+            bucket.confidence = Math.max(bucket.confidence, Number(item.confidence) || 0);
+            if (item.evidence && bucket.evidence.length < 3 && !bucket.evidence.includes(item.evidence)) {
+                bucket.evidence.push(item.evidence);
+            }
+        }
+    }
+    return [...buckets.values()].sort((a, b) =>
+        b.count - a.count
+        || a.from.localeCompare(b.from, 'zh-Hans-CN')
+        || a.to.localeCompare(b.to, 'zh-Hans-CN')
+        || a.call.localeCompare(b.call, 'zh-Hans-CN'));
+}
+
+/** 结果里出现过的所有人物名，按出现次数从多到少。 */
+export function collectNames(results) {
+    const counter = new Map();
+    for (const item of results ?? []) {
+        counter.set(item.from, (counter.get(item.from) ?? 0) + item.count);
+        counter.set(item.to, (counter.get(item.to) ?? 0) + item.count);
+    }
+    return [...counter.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'zh-Hans-CN')).map(([name]) => name);
+}
+
+/** 代词不自动映射——小说里的「我」通常是主角，不是坐在屏幕前的你。 */
+const PRONOUN_NAMES = new Set(['我', '你', '他', '她', '它', '您', '咱', '俺', '我们', '你们', '他们', '她们', '大家', '对方']);
+
+/**
+ * 把小说人物名映射到当前聊天的参与者键。
+ * 精确同名 → 单向前缀包含且唯一 → 否则留空等人工指定。代词一律留空。
+ */
+export function autoMapNames(names, participants) {
+    const map = {};
+    const list = participants ?? [];
+    for (const raw of names ?? []) {
+        const name = str(raw).trim();
+        if (!name) continue;
+        if (PRONOUN_NAMES.has(name)) {
+            map[name] = null;
+            continue;
+        }
+        const exact = list.find(p => p.name === name);
+        if (exact) {
+            map[name] = exact.key;
+            continue;
+        }
+        const loose = list.filter(p => p.name.startsWith(name) || name.startsWith(p.name));
+        map[name] = loose.length === 1 ? loose[0].key : null;
+    }
+    return map;
+}
+
+/**
+ * 把「人物名级」的提取结果按映射翻成「参与者键级」的补丁。
+ * 映射不上的直接丢掉，不做猜测。
+ */
+export function buildPatches(results, mapping) {
+    const patches = [];
+    for (const item of results ?? []) {
+        const from = mapping?.[item.from];
+        const to = mapping?.[item.to];
+        if (!from || !to || from === to) continue;
+        patches.push({ from, to, call: item.call, count: item.count ?? 1 });
+    }
+    return patches;
+}
+
+/**
+ * 同一对关系里的多个称呼，取出现最多的当主称呼，其余降为别名。
+ * 这就是「不用自己填表」的关键一步。
+ */
+export function patchesToRelations(patches) {
+    const byPair = new Map();
+    for (const patch of patches ?? []) {
+        const key = relationKey(patch.from, patch.to);
+        let group = byPair.get(key);
+        if (!group) {
+            group = { from: patch.from, to: patch.to, calls: [] };
+            byPair.set(key, group);
+        }
+        group.calls.push({ call: patch.call, count: patch.count ?? 1 });
+    }
+    const out = [];
+    for (const group of byPair.values()) {
+        group.calls.sort((a, b) => (b.count - a.count) || a.call.localeCompare(b.call, 'zh-Hans-CN'));
+        const main = group.calls[0].call;
+        out.push({
+            from: group.from,
+            to: group.to,
+            call: main,
+            aliases: uniq(group.calls.slice(1).map(c => c.call)).filter(a => a !== main),
+        });
+    }
+    return out;
+}
+
+/** 一次性把提取结果写进聊天关系表，返回新状态。 */
+export function applyExtractToChatState(chatState, results, mapping) {
+    let next = normalizeChatState(chatState);
+    for (const rel of patchesToRelations(buildPatches(results, mapping))) {
+        next = setRelation(next, rel.from, rel.to, { call: rel.call, aliases: rel.aliases });
+    }
+    return next;
 }
 
 /* ------------------------------------------------------------------ *

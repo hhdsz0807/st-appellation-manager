@@ -50,6 +50,324 @@ function button(labelText, onClick, extraClass = '') {
     });
 }
 
+/**
+ * 「从正文提取称呼」区块。
+ * 流程：粘正文 → 调模型逐块抽 → 把小说人名映射到当前聊天的角色 → 一键写成称呼表。
+ */
+function createExtractSection(api, setStatus) {
+    const ui = { sourceName: '' };
+
+    /* ---------- 正文输入 ---------- */
+
+    const textarea = el('textarea', {
+        id: 'stam-extract-text',
+        class: 'stam-textarea',
+        rows: '6',
+        placeholder: '把小说正文粘贴到这里，或点下面的按钮导入 .txt / .md 文件。\n\n正文只留在浏览器内存里，不会写进聊天记录——刷新页面后需要重新粘贴（提取出来的结果会保留）。',
+    });
+    textarea.value = api.getExtractText();
+    textarea.addEventListener('input', () => {
+        api.setExtractText(textarea.value, ui.sourceName);
+        updatePlan();
+    });
+
+    const fileInput = el('input', { type: 'file', accept: '.txt,.md,text/plain', style: { display: 'none' } });
+    fileInput.addEventListener('change', async () => {
+        const file = fileInput.files?.[0];
+        fileInput.value = '';
+        if (!file) return;
+        try {
+            const text = await file.text();
+            textarea.value = text;
+            ui.sourceName = file.name;
+            api.setExtractText(text, file.name);
+            updatePlan();
+            setStatus(`已读入 ${file.name}（${text.length} 字）`);
+        } catch (error) {
+            setStatus(`读文件失败：${error.message}`);
+        }
+    });
+
+    /* ---------- 模型来源 ---------- */
+
+    const settings0 = api.getExtractSettings();
+
+    const modeSelect = el('select', { id: 'stam-extract-mode' }, [
+        el('option', { value: 'st', text: '酒馆当前连接（推荐）' }),
+        el('option', { value: 'custom', text: '自定义 OpenAI 兼容端点' }),
+    ]);
+    modeSelect.value = settings0.mode;
+    modeSelect.addEventListener('change', () => {
+        api.setExtractOption('mode', modeSelect.value);
+        syncMode();
+    });
+
+    const baseUrlInput = el('input', { type: 'text', id: 'stam-extract-baseurl', placeholder: 'https://api.example.com/v1' });
+    baseUrlInput.value = settings0.custom.baseUrl;
+    baseUrlInput.addEventListener('change', () => api.setExtractCustom('baseUrl', baseUrlInput.value.trim()));
+
+    const modelInput = el('input', { type: 'text', id: 'stam-extract-model', placeholder: '模型名，例如 deepseek-chat' });
+    modelInput.value = settings0.custom.model;
+    modelInput.addEventListener('change', () => api.setExtractCustom('model', modelInput.value.trim()));
+
+    const apiKeyInput = el('input', { type: 'password', id: 'stam-extract-apikey', placeholder: 'API Key（明文存在酒馆设置里）', autocomplete: 'off' });
+    apiKeyInput.value = settings0.custom.apiKey;
+    apiKeyInput.addEventListener('change', () => api.setExtractCustom('apiKey', apiKeyInput.value.trim()));
+
+    const customBox = el('div', { class: 'stam-grid' }, [
+        field('端点地址', baseUrlInput),
+        field('模型名', modelInput),
+        field('API Key', apiKeyInput),
+    ]);
+
+    /* ---------- 分块 ---------- */
+
+    const chunkInput = el('input', { type: 'number', min: '200', max: '20000', step: '100', id: 'stam-extract-chunk' });
+    chunkInput.value = String(settings0.chunkChars);
+    chunkInput.addEventListener('change', () => {
+        api.setExtractOption('chunkChars', Number(chunkInput.value));
+        updatePlan();
+    });
+
+    const maxChunksInput = el('input', { type: 'number', min: '1', max: '200', step: '1', id: 'stam-extract-maxchunks' });
+    maxChunksInput.value = String(settings0.maxChunks);
+    maxChunksInput.addEventListener('change', () => {
+        api.setExtractOption('maxChunks', Number(maxChunksInput.value));
+        updatePlan();
+    });
+
+    const offsetInput = el('input', { type: 'number', min: '0', step: '100', id: 'stam-extract-offset' });
+    offsetInput.value = String(settings0.startOffset);
+    offsetInput.addEventListener('change', () => {
+        api.setExtractOption('startOffset', Number(offsetInput.value));
+        updatePlan();
+    });
+
+    const planHint = el('div', { class: 'stam-hint', id: 'stam-extract-plan' });
+
+    /* ---------- 运行 ---------- */
+
+    const runBtn = button('开始提取', async () => {
+        runBtn.disabled = true;
+        setStatus('提取中…');
+        const result = await api.startExtract();
+        runBtn.disabled = false;
+        if (!result.started) {
+            setStatus(result.reason ?? '没有开始');
+            return;
+        }
+        const bits = [`合并后 ${result.results} 条关系`];
+        bits.push(`名字映射上 ${result.mapped}/${result.names} 个`);
+        if (result.failures) bits.push(`${result.failures} 块失败`);
+        if (result.aborted) bits.push('（已中止）');
+        if (result.stoppedEarly) bits.push('（连续失败，提前停了）');
+        setStatus(`提取完成：${bits.join('，')}。检查下面的映射，再点「采纳全部已映射」。`);
+    });
+
+    const abortBtn = button('中止', () => api.abortExtract(), 'stam-danger');
+    abortBtn.disabled = true;
+
+    const progressBar = el('div', { class: 'stam-progress-fill' });
+    const progressWrap = el('div', { class: 'stam-progress' }, [progressBar]);
+    const progressText = el('div', { class: 'stam-hint' });
+    const logBox = el('div', { class: 'stam-log' });
+
+    /* ---------- 结果 ---------- */
+
+    const resultBox = el('div', { class: 'stam-extract-results' });
+    const mappingBox = el('div', { class: 'stam-mapping' });
+
+    const actions = el('div', { class: 'stam-toolbar' }, [
+        button('采纳全部已映射', () => {
+            const outcome = api.applyExtract();
+            if (!outcome.applied) {
+                setStatus('没有可采纳的行——先看下面的名字映射，有「未映射」就对一下。');
+                return;
+            }
+            setStatus(`已写入 ${outcome.applied} 对关系${outcome.unmapped.length ? `；${outcome.unmapped.length} 个名字没映射，已跳过：${outcome.unmapped.join('、')}` : ''}`);
+            render();
+        }),
+        button('存为全局默认库', () => {
+            const count = api.saveExtractToLibrary();
+            setStatus(count ? `已把 ${count} 对关系存进全局默认库，别的聊天也能用` : '没有可存的关系（先完成名字映射）');
+            render();
+        }),
+        button('清空提取结果', () => {
+            if (!window.confirm('清空本聊天的提取结果与名字映射？（不影响已经写进称呼关系表的内容）')) return;
+            api.clearExtract();
+            setStatus('已清空提取结果');
+            render();
+        }, 'stam-danger'),
+    ]);
+
+    /* ---------- 组装 ---------- */
+
+    const root = el('fieldset', { class: 'stam-box', id: 'stam-extract-box' }, [
+        el('legend', { text: '正文提取' }),
+        el('details', { class: 'stam-extract', open: 'open' }, [
+            el('summary', { text: '从正文提取称呼（让模型自动生成称呼表）' }),
+            el('div', { class: 'stam-extract-body' }, [
+                textarea,
+                el('div', { class: 'stam-toolbar' }, [
+                    button('导入 txt / md 文件', () => fileInput.click()),
+                    button('清空正文', () => {
+                        textarea.value = '';
+                        ui.sourceName = '';
+                        api.setExtractText('', '');
+                        updatePlan();
+                    }),
+                    fileInput,
+                ]),
+                field('用哪个模型', modeSelect, '「酒馆当前连接」= 你已经在酒馆里配好的那个模型，不用再填密钥'),
+                customBox,
+                el('div', { class: 'stam-grid' }, [
+                    field('每块字数', chunkInput, '越大越省请求，但模型容易看漏'),
+                    field('最多几块', maxChunksInput, '一次最多发几次请求'),
+                    field('从第几个字开始', offsetInput, '长篇分几次跑时用'),
+                ]),
+                planHint,
+                el('div', { class: 'stam-toolbar' }, [runBtn, abortBtn]),
+                progressWrap,
+                progressText,
+                logBox,
+                el('div', { class: 'stam-subtitle', text: '提取结果' }),
+                resultBox,
+                el('div', { class: 'stam-subtitle', text: '名字映射（小说人名 → 当前聊天里的角色）' }),
+                mappingBox,
+                actions,
+            ]),
+        ]),
+    ]);
+
+    /* ---------- 行为 ---------- */
+
+    function syncMode() {
+        customBox.style.display = modeSelect.value === 'custom' ? '' : 'none';
+    }
+
+    function updatePlan() {
+        const plan = api.planExtract();
+        if (!String(api.getExtractText()).trim()) {
+            planHint.textContent = '还没有正文。粘贴或导入之后，这里会先告诉你要发几次请求。';
+            return;
+        }
+        if (!plan.requests) {
+            planHint.textContent = `起始位置（第 ${offsetInput.value} 字）已经超过正文长度（${plan.total} 字），把起始位置改小。`;
+            return;
+        }
+        planHint.textContent = `计划：发送 ${plan.requests} 次请求，处理第 ${plan.from}–${plan.to} 字；正文共 ${plan.total} 字，之后还剩 ${plan.remaining} 字。`;
+    }
+
+    function renderProgress(state) {
+        if (state.running && state.progress) {
+            const pct = state.progress.total ? Math.round((state.progress.done / state.progress.total) * 100) : 0;
+            progressBar.style.width = `${pct}%`;
+            progressText.textContent = `进行中：第 ${state.progress.done}/${state.progress.total} 块（${pct}%）`;
+            progressWrap.style.display = '';
+        } else if (state.extract.chunksTotal) {
+            progressBar.style.width = '100%';
+            progressText.textContent = `上次跑了 ${state.extract.chunksDone}/${state.extract.chunksTotal} 块。`;
+            progressWrap.style.display = '';
+        } else {
+            progressWrap.style.display = 'none';
+            progressText.textContent = '';
+        }
+        runBtn.disabled = state.running;
+        abortBtn.disabled = !state.running;
+    }
+
+    function renderLog(state) {
+        logBox.textContent = '';
+        if (!state.log.length) return;
+        for (const line of state.log) {
+            logBox.append(el('div', { class: 'stam-log-line', text: line }));
+        }
+    }
+
+    function renderResults(state) {
+        resultBox.textContent = '';
+        const mapping = state.extract.mapping ?? {};
+        const results = state.extract.results ?? [];
+        if (!results.length) {
+            resultBox.append(el('div', { class: 'stam-hint', text: '还没有提取结果。' }));
+            return;
+        }
+        const shown = results.slice(0, 300);
+        resultBox.append(el('div', { class: 'stam-x-rows' }, [
+            el('div', { class: 'stam-x-row stam-x-head' }, [
+                el('div', { text: '关系' }),
+                el('div', { text: '称呼' }),
+                el('div', { text: '命中' }),
+                el('div', { text: '证据' }),
+            ]),
+            ...shown.map(item => {
+                const ready = Boolean(mapping[item.from]) && Boolean(mapping[item.to]);
+                return el('div', { class: `stam-x-row${ready ? '' : ' stam-x-unmapped'}` }, [
+                    el('div', { class: 'stam-pair' }, [
+                        el('span', { text: item.from }),
+                        el('span', { class: 'stam-arrow', text: '→' }),
+                        el('span', { text: item.to }),
+                        ready ? null : el('span', { class: 'stam-badge', text: '未映射' }),
+                    ]),
+                    el('strong', { text: item.call }),
+                    el('div', { class: 'stam-hint', text: `${item.count} 块 / ${(item.confidence * 100).toFixed(0)}%` }),
+                    el('div', { class: 'stam-hint', text: item.evidence?.[0] ?? '' }),
+                ]);
+            }),
+        ]));
+        if (results.length > shown.length) {
+            resultBox.append(el('div', { class: 'stam-hint', text: `还有 ${results.length - shown.length} 条未显示。` }));
+        }
+    }
+
+    function renderMapping(state) {
+        mappingBox.textContent = '';
+        const names = state.names ?? [];
+        if (!names.length) {
+            mappingBox.append(el('div', { class: 'stam-hint', text: '还没有要映射的人名。' }));
+            return;
+        }
+        const participants = state.participants ?? [];
+        const user = participants.find(p => p.kind === 'user');
+        mappingBox.append(el('div', {
+            class: 'stam-hint',
+            text: '代词（我/你/他/她）不会自动映射——小说里的「我」多半是主角，不是坐在屏幕前的你。要指到你身上就手动选。',
+        }));
+        for (const name of names) {
+            const options = [
+                el('option', { value: '', text: '不映射' }),
+                ...(user ? [el('option', { value: user.key, text: `用户：${user.name}` })] : []),
+                ...participants.filter(p => p.kind === 'character').map(p => el('option', { value: p.key, text: p.name })),
+            ];
+            const select = el('select', { class: 'stam-map-select' }, options);
+            select.value = state.extract.mapping?.[name] ?? '';
+            select.addEventListener('change', () => {
+                api.setMapping(name, select.value);
+                render();
+            });
+            const mapped = Boolean(state.extract.mapping?.[name]);
+            mappingBox.append(el('div', { class: `stam-map-row${mapped ? '' : ' stam-x-unmapped'}` }, [
+                el('span', { class: 'stam-map-name', text: name }),
+                select,
+            ]));
+        }
+    }
+
+    function render() {
+        const state = api.getExtractUiState();
+        syncMode();
+        renderProgress(state);
+        renderLog(state);
+        renderResults(state);
+        renderMapping(state);
+        updatePlan();
+    }
+
+    syncMode();
+    render();
+    return { root, render };
+}
+
 export function createPanel(api) {
     const state = {
         collapsed: false,
@@ -188,7 +506,10 @@ export function createPanel(api) {
 
     /* ---------------- 组装 ---------------- */
 
+    const extractSection = createExtractSection(api, setStatus);
+
     const content = el('div', { class: 'stam-content' }, [
+        extractSection.root,
         injectBox,
         el('fieldset', { class: 'stam-box' }, [
             el('legend', { text: '称呼关系' }),
@@ -410,13 +731,14 @@ export function createPanel(api) {
         renderRelations();
         renderCandidates();
         renderIssues();
+        extractSection.render();
         filterBar.querySelectorAll('.stam-chip').forEach(chip => {
             chip.classList.toggle('stam-chip-active', chip.dataset.filter === state.filter);
         });
     }
 
     render();
-    return { root, render, setStatus };
+    return { root, render, renderExtract: extractSection.render, setStatus };
 }
 
 export default createPanel;

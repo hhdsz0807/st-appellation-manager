@@ -253,3 +253,111 @@
     margin: 4px 0 8px 1.2em;
     padding: 0;
 }
+
+/* ---------- 正文提取 ---------- */
+
+#stam-panel .stam-extract summary {
+    cursor: pointer;
+    font-weight: 600;
+}
+
+#stam-panel .stam-extract-body {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 8px;
+}
+
+#stam-panel .stam-textarea {
+    width: 100%;
+    min-height: 110px;
+    resize: vertical;
+    font-family: inherit;
+    font-size: 0.9em;
+    line-height: 1.5;
+    padding: 6px;
+    border-radius: 4px;
+    border: 1px solid var(--SmartThemeBorderColor, #555);
+    background: var(--SmartThemeBlurTintColor, rgba(0, 0, 0, 0.2));
+    color: inherit;
+}
+
+#stam-panel .stam-progress {
+    height: 8px;
+    border-radius: 4px;
+    overflow: hidden;
+    border: 1px solid var(--SmartThemeBorderColor, #555);
+    background: var(--SmartThemeBlurTintColor, rgba(0, 0, 0, 0.2));
+}
+
+#stam-panel .stam-progress-fill {
+    height: 100%;
+    width: 0;
+    background: var(--SmartThemeQuoteColor, #c9a227);
+    transition: width 0.2s ease;
+}
+
+#stam-panel .stam-log {
+    max-height: 120px;
+    overflow-y: auto;
+    font-size: 0.8em;
+    opacity: 0.85;
+    border-left: 2px solid var(--SmartThemeBorderColor, #555);
+    padding-left: 6px;
+}
+
+#stam-panel .stam-log-line {
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+#stam-panel .stam-x-rows {
+    max-height: 260px;
+    overflow-y: auto;
+}
+
+#stam-panel .stam-x-row {
+    display: grid;
+    grid-template-columns: minmax(130px, 1.3fr) 0.8fr 0.7fr 1.4fr;
+    gap: 4px 8px;
+    align-items: center;
+    padding: 3px 2px;
+    border-bottom: 1px dashed var(--SmartThemeBorderColor, #444);
+}
+
+#stam-panel .stam-x-head {
+    font-weight: 600;
+    font-size: 0.85em;
+    opacity: 0.85;
+    position: sticky;
+    top: 0;
+    background: var(--SmartThemeBlurTintColor, rgba(0, 0, 0, 0.4));
+    z-index: 1;
+}
+
+#stam-panel .stam-x-unmapped {
+    opacity: 0.5;
+}
+
+#stam-panel .stam-mapping {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
+#stam-panel .stam-map-row {
+    display: grid;
+    grid-template-columns: 1fr 1.4fr;
+    gap: 6px;
+    align-items: center;
+}
+
+#stam-panel .stam-map-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+#stam-panel .stam-map-select {
+    width: 100%;
+}

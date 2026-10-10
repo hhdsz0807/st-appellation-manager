@@ -10,9 +10,14 @@
 import {
     EXT_ID,
     USER_KEY,
+    applyExtractToChatState,
+    autoMapNames,
     buildParticipants,
+    buildPatches,
+    chunkText,
     clearAllRelations,
     clearRelation,
+    collectNames,
     composeInlineTable,
     composePromptBlock,
     defaultSettings,
@@ -22,13 +27,18 @@ import {
     getRelation,
     importBundle,
     lintRelations,
+    mergeExtractResults,
     normalizeChatState,
+    normalizeExtractState,
     normalizeSettings,
     parseRelationKey,
+    patchesToRelations,
+    relationKey,
     resolveRelation,
     scanCandidates,
     setRelation as setRelationPure,
 } from './core.js';
+import { createCaller, runExtraction } from './extract.js';
 import { createPanel } from './ui.js';
 
 /** 注入用的键名；酒馆内部用它区分不同扩展的注入内容。 */
@@ -42,6 +52,21 @@ let initialized = false;
 const registeredMacros = [];
 /** 记录已绑定的 { 事件名, 处理函数 }，卸载时才能精确解绑。 */
 const boundListeners = [];
+
+/**
+ * 提取的运行态。故意只放内存：
+ * 正文可能有几百 KB，塞进 chat_metadata 会让每次存聊天都拖着一坨文本。
+ * 代价是刷新页面后需要重新粘贴正文（提取出来的结果本身是持久化的）。
+ */
+const extractRuntime = {
+    text: '',
+    sourceName: '',
+    running: false,
+    abortRequested: false,
+    progress: null,
+    log: [],
+    startedAt: 0,
+};
 
 /* ------------------------------------------------------------------ *
  * 宿主对接
@@ -244,7 +269,257 @@ const api = {
         });
         input.click();
     },
+
+    /* ---------------- 正文提取 ---------------- */
+
+    getExtractUiState() {
+        const extract = readChatState().extract;
+        return {
+            extract,
+            names: collectNames(extract.results),
+            participants: participantsOf(),
+            running: extractRuntime.running,
+            progress: extractRuntime.progress,
+            log: extractRuntime.log.slice(-12),
+            textChars: extractRuntime.text.length,
+            sourceName: extractRuntime.sourceName,
+        };
+    },
+    getExtractText() {
+        return extractRuntime.text;
+    },
+    setExtractText(text, sourceName = '') {
+        extractRuntime.text = String(text ?? '');
+        if (sourceName) extractRuntime.sourceName = String(sourceName).slice(0, 200);
+    },
+    getExtractSettings() {
+        return getSettings().extract;
+    },
+    /** 开跑前先算清代价：要发几次请求、处理正文的哪一段。 */
+    planExtract() {
+        const extract = getSettings().extract;
+        const text = extractRuntime.text;
+        const chunks = chunkText(text, {
+            chunkChars: extract.chunkChars,
+            maxChunks: extract.maxChunks,
+            startOffset: extract.startOffset,
+        });
+        const first = chunks[0];
+        const last = chunks[chunks.length - 1];
+        return {
+            requests: chunks.length,
+            from: first ? first.start : 0,
+            to: last ? last.end : 0,
+            total: text.length,
+            remaining: Math.max(0, text.length - (last ? last.end : 0)),
+        };
+    },
+    setExtractOption(key, value) {
+        const settings = getSettings();
+        settings.extract = { ...settings.extract, [key]: value };
+        saveSettings();
+    },
+    setExtractCustom(key, value) {
+        const settings = getSettings();
+        settings.extract.custom = { ...settings.extract.custom, [key]: value };
+        saveSettings();
+    },
+    setMapping(name, key) {
+        const state = readChatState();
+        state.extract.mapping = { ...state.extract.mapping, [name]: key || null };
+        writeChatState({ ...state, extract: normalizeExtractState(state.extract) });
+    },
+    abortExtract() {
+        if (!extractRuntime.running) return;
+        extractRuntime.abortRequested = true;
+        logExtract('已请求中止，等当前这块收尾…');
+        try {
+            host()?.stopGeneration?.();
+        } catch (error) {
+            console.warn(LOG_PREFIX, '中止请求失败', error);
+        }
+        panel?.renderExtract();
+    },
+
+    async startExtract() {
+        if (extractRuntime.running) return { started: false, reason: '已经在跑了' };
+        const ctx = host();
+        if (!ctx) return { started: false, reason: '取不到酒馆上下文' };
+
+        const extract = getSettings().extract;
+        const text = extractRuntime.text;
+        if (!text.trim()) return { started: false, reason: '先粘贴正文或导入 txt 文件' };
+
+        const plan = api.planExtract();
+        if (!plan.requests) return { started: false, reason: '这个起始位置已经超过正文长度了' };
+
+        const modelLabel = extract.mode === 'custom'
+            ? `自定义端点 ${extract.custom.model || '（未填模型名）'}`
+            : '酒馆当前连接';
+        const confirmed = window.confirm(
+            `要发 ${plan.requests} 次模型请求，处理第 ${plan.from}–${plan.to} 字（正文共 ${plan.total} 字）。\n`
+            + `模型：${modelLabel}\n\n每次请求都会真的调用模型。继续？`,
+        );
+        if (!confirmed) return { started: false, reason: '已取消' };
+
+        let caller;
+        try {
+            caller = createCaller(extract, ctx, { maxTokens: 1600 });
+        } catch (error) {
+            return { started: false, reason: `模型配置有问题：${error.message}` };
+        }
+
+        extractRuntime.running = true;
+        extractRuntime.abortRequested = false;
+        extractRuntime.startedAt = Date.now();
+        extractRuntime.log = [];
+        extractRuntime.progress = { done: 0, total: plan.requests };
+        panel?.renderExtract();
+
+        let outcome;
+        try {
+            outcome = await runExtraction({
+                text,
+                opts: {
+                    chunkChars: extract.chunkChars,
+                    maxChunks: extract.maxChunks,
+                    startOffset: extract.startOffset,
+                },
+                caller,
+                shouldAbort: () => extractRuntime.abortRequested,
+                onProgress: progress => {
+                    if (progress.total) {
+                        extractRuntime.progress = { done: progress.done ?? 0, total: progress.total };
+                    }
+                    describeProgress(progress);
+                    panel?.renderExtract();
+                },
+            });
+        } catch (error) {
+            console.error(LOG_PREFIX, '提取过程出错', error);
+            logExtract(`出错：${error?.message ?? error}`);
+            extractRuntime.running = false;
+            panel?.renderExtract();
+            return { started: false, reason: `提取失败：${error?.message ?? error}` };
+        }
+
+        extractRuntime.running = false;
+
+        // 新结果和上一次的结果合并（同一部小说分几次跑时不会互相覆盖）。
+        const state = readChatState();
+        const merged = mergeExtractResults([state.extract.results, outcome.results]);
+        const names = collectNames(merged);
+        const autoMapping = autoMapNames(names, participantsOf());
+        const mapping = {};
+        for (const name of names) {
+            // 人工改过的映射优先保留，其次用自动匹配的结果。
+            mapping[name] = Object.prototype.hasOwnProperty.call(state.extract.mapping, name)
+                ? state.extract.mapping[name]
+                : (autoMapping[name] ?? null);
+        }
+
+        writeChatState({
+            ...state,
+            extract: normalizeExtractState({
+                createdAt: state.extract.createdAt || Date.now(),
+                updatedAt: Date.now(),
+                sourceName: extractRuntime.sourceName || state.extract.sourceName,
+                sourceChars: text.length,
+                chunksDone: extractRuntime.progress?.done ?? 0,
+                chunksTotal: outcome.chunks,
+                nextOffset: outcome.nextOffset,
+                results: merged,
+                mapping,
+                notes: outcome.failures.slice(0, 5).map(f => `第 ${f.index + 1} 块失败：${f.error}`),
+            }),
+        });
+
+        const mapped = names.filter(n => mapping[n]).length;
+        logExtract(`本轮结束：${outcome.results.length} 条新关系，合并后 ${merged.length} 条，名字映射上 ${mapped}/${names.length} 个`);
+        panel?.render();
+        return {
+            started: true,
+            results: merged.length,
+            mapped,
+            names: names.length,
+            failures: outcome.failures.length,
+            aborted: outcome.aborted,
+            stoppedEarly: outcome.stoppedEarly,
+            nextOffset: outcome.nextOffset,
+        };
+    },
+
+    /** 把已映射的提取结果写成称呼关系。原来手填的关系会被同键覆盖，其余保留。 */
+    applyExtract() {
+        const state = readChatState();
+        const extract = state.extract;
+        if (!extract.results.length) return { applied: 0, unmapped: [] };
+        const unmapped = collectNames(extract.results).filter(n => !extract.mapping[n]);
+        const next = applyExtractToChatState(state, extract.results, extract.mapping);
+        writeChatState(next);
+        refreshInjection();
+        return { applied: patchesToRelations(buildPatches(extract.results, extract.mapping)).length, unmapped };
+    },
+
+    /** 把这批结果存进全局默认库，换到别的聊天也能用。 */
+    saveExtractToLibrary() {
+        const state = readChatState();
+        const extract = state.extract;
+        const relations = patchesToRelations(buildPatches(extract.results, extract.mapping));
+        if (!relations.length) return 0;
+        const settings = getSettings();
+        const library = { ...settings.library };
+        for (const rel of relations) {
+            library[relationKey(rel.from, rel.to)] = {
+                call: rel.call,
+                aliases: rel.aliases,
+                stage: '',
+                note: '',
+            };
+        }
+        settings.library = library;
+        saveSettings();
+        refreshInjection();
+        return relations.length;
+    },
+
+    clearExtract() {
+        const state = readChatState();
+        writeChatState({ ...state, extract: normalizeExtractState(null) });
+        panel?.render();
+    },
 };
+
+/** 提取日志只留最近 200 行，够回溯就行。 */
+function logExtract(line) {
+    extractRuntime.log.push(line);
+    if (extractRuntime.log.length > 200) extractRuntime.log.splice(0, extractRuntime.log.length - 200);
+}
+
+function describeProgress(progress) {
+    switch (progress.phase) {
+        case 'begin':
+            logExtract(`开始：切成 ${progress.total} 块`);
+            break;
+        case 'chunk':
+            logExtract(`第 ${progress.index + 1}/${progress.total} 块（第 ${progress.start}–${progress.end} 字）…`);
+            break;
+        case 'ok':
+            logExtract(`第 ${progress.index + 1}/${progress.total} 块 ✓ 抽到 ${progress.got} 条`);
+            break;
+        case 'badjson':
+            logExtract(`第 ${progress.index + 1}/${progress.total} 块 ✗ ${progress.error}`);
+            break;
+        case 'fail':
+            logExtract(`第 ${progress.index + 1}/${progress.total} 块 ✗ ${progress.error}`);
+            break;
+        case 'stoppedEarly':
+            logExtract(`连续失败 ${progress.failures.length} 次，提前停下，不再继续烧请求`);
+            break;
+        default:
+            break;
+    }
+}
 
 /* ------------------------------------------------------------------ *
  * 面板挂载

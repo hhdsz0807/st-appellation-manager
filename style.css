@@ -1,0 +1,255 @@
+/* 称呼管理器 · 样式
+   颜色全部走酒馆的主题变量，跟随用户的主题切换，不写死色值。 */
+
+#stam-panel {
+    margin-top: 8px;
+    border: 1px solid var(--SmartThemeBorderColor, #555);
+    border-radius: 6px;
+    padding: 8px;
+    background: var(--SmartThemeBlurTintColor, rgba(0, 0, 0, 0.15));
+    color: var(--SmartThemeBodyColor, #ddd);
+    font-size: 0.92em;
+}
+
+#stam-panel .stam-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+#stam-panel .stam-title {
+    font-weight: 600;
+    color: var(--SmartThemeQuoteColor, #c9a227);
+}
+
+#stam-panel .stam-collapse {
+    width: 24px;
+    height: 24px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+#stam-panel .stam-content {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-top: 8px;
+}
+
+#stam-panel .stam-box {
+    border: 1px solid var(--SmartThemeBorderColor, #555);
+    border-radius: 5px;
+    padding: 6px 8px 8px;
+    margin: 0;
+}
+
+#stam-panel .stam-box legend {
+    font-weight: 600;
+    padding: 0 4px;
+}
+
+#stam-panel .stam-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 6px;
+    margin-bottom: 6px;
+}
+
+#stam-panel .stam-field {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+#stam-panel .stam-field-label {
+    font-size: 0.85em;
+    opacity: 0.8;
+}
+
+#stam-panel .stam-field select,
+#stam-panel .stam-field input {
+    width: 100%;
+}
+
+#stam-panel .stam-checks {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 12px;
+}
+
+#stam-panel .stam-check {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    cursor: pointer;
+}
+
+#stam-panel .stam-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+    margin-bottom: 6px;
+}
+
+#stam-panel .stam-btn {
+    padding: 3px 10px;
+    cursor: pointer;
+    border-radius: 4px;
+    border: 1px solid var(--SmartThemeBorderColor, #555);
+    background: var(--SmartThemeBlurTintColor, rgba(0, 0, 0, 0.2));
+    color: inherit;
+}
+
+#stam-panel .stam-btn:hover {
+    border-color: var(--SmartThemeQuoteColor, #c9a227);
+}
+
+#stam-panel .stam-btn.stam-small {
+    padding: 1px 7px;
+    font-size: 0.85em;
+}
+
+#stam-panel .stam-btn.stam-danger {
+    border-color: var(--SmartThemeQuoteColor, #b4553f);
+    opacity: 0.9;
+}
+
+#stam-panel .stam-chip {
+    padding: 1px 8px;
+    cursor: pointer;
+    border-radius: 10px;
+    border: 1px solid var(--SmartThemeBorderColor, #555);
+    background: transparent;
+    color: inherit;
+    font-size: 0.85em;
+}
+
+#stam-panel .stam-chip-active {
+    border-color: var(--SmartThemeQuoteColor, #c9a227);
+    font-weight: 600;
+}
+
+#stam-panel .stam-rows {
+    max-height: 340px;
+    overflow-y: auto;
+}
+
+#stam-panel .stam-row {
+    display: grid;
+    grid-template-columns: minmax(120px, 1.4fr) 1fr 1fr 0.8fr 1fr auto;
+    gap: 4px;
+    align-items: center;
+    padding: 2px 0;
+    border-bottom: 1px dashed var(--SmartThemeBorderColor, #444);
+}
+
+#stam-panel .stam-row-head {
+    font-weight: 600;
+    font-size: 0.85em;
+    opacity: 0.85;
+    position: sticky;
+    top: 0;
+    background: var(--SmartThemeBlurTintColor, rgba(0, 0, 0, 0.4));
+    z-index: 1;
+}
+
+#stam-panel .stam-row-empty {
+    opacity: 0.65;
+}
+
+#stam-panel .stam-pair {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+#stam-panel .stam-arrow {
+    opacity: 0.6;
+}
+
+#stam-panel .stam-badge {
+    font-size: 0.72em;
+    padding: 0 4px;
+    border-radius: 3px;
+    border: 1px solid var(--SmartThemeBorderColor, #555);
+    opacity: 0.8;
+}
+
+#stam-panel .stam-badge-chat {
+    border-color: var(--SmartThemeQuoteColor, #c9a227);
+}
+
+#stam-panel .stam-input-call,
+#stam-panel .stam-input-alias,
+#stam-panel .stam-input-stage,
+#stam-panel .stam-input-note {
+    min-width: 0;
+}
+
+#stam-panel .stam-subtitle {
+    font-weight: 600;
+    margin: 6px 0 4px;
+}
+
+#stam-panel .stam-cand-list,
+#stam-panel .stam-issue-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 260px;
+    overflow-y: auto;
+}
+
+#stam-panel .stam-cand {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 4px 8px;
+    align-items: center;
+    padding: 4px;
+    border: 1px solid var(--SmartThemeBorderColor, #555);
+    border-radius: 4px;
+}
+
+#stam-panel .stam-cand .stam-hint {
+    grid-column: 1 / -1;
+}
+
+#stam-panel .stam-issue {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px;
+    border-radius: 4px;
+    border: 1px solid var(--SmartThemeBorderColor, #555);
+}
+
+#stam-panel .stam-issue-warn {
+    border-color: var(--SmartThemeQuoteColor, #b4553f);
+}
+
+#stam-panel .stam-hint {
+    font-size: 0.82em;
+    opacity: 0.72;
+}
+
+#stam-panel .stam-status {
+    font-size: 0.85em;
+    opacity: 0.85;
+    min-height: 1.2em;
+}
+
+#stam-panel .stam-help summary {
+    cursor: pointer;
+    font-weight: 600;
+}
+
+#stam-panel .stam-help ul {
+    margin: 4px 0 8px 1.2em;
+    padding: 0;
+}

@@ -1,0 +1,9 @@
+{
+    "display_name": "称呼管理器 (Appellation Manager)",
+    "loading_order": 30,
+    "js": "index.js",
+    "css": "style.css",
+    "author": "DSH",
+    "version": "1.0.0",
+    "auto_update": false
+}

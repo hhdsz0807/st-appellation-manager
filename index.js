@@ -39,6 +39,7 @@ import {
     normalizeNovel,
     normalizeNovels,
     normalizeSettings,
+    createSettingsCache,
     novelGraphInput,
     novelTableToText,
     parseRelationKey,
@@ -54,6 +55,9 @@ import { createPanel } from './ui.js';
 /** 注入用的键名；酒馆内部用它区分不同扩展的注入内容。 */
 const INJECT_KEY = 'st_appellation_manager';
 const LOG_PREFIX = '[称呼管理器]';
+
+/** 设置对象缓存：保证同一个源对象在多次读取之间返回同一个实例（见 core.js 的说明）。 */
+const settingsCache = createSettingsCache();
 
 let panel = null;
 let panelTimer = null;
@@ -104,8 +108,12 @@ function getSettings() {
     if (!ctx) return defaultSettings();
     const store = ctx.extensionSettings;
     if (!store) return defaultSettings();
-    store[EXT_ID] = normalizeSettings(store[EXT_ID]);
-    return store[EXT_ID];
+    // 关键：同一个源对象必须返回同一个实例。
+    // 否则「读设置 → await → 写回」会写到已经被换掉的孤儿对象上，
+    // 表现为接口成功了、界面却什么都没有。
+    const cached = settingsCache.get(store[EXT_ID]);
+    if (store[EXT_ID] !== cached) store[EXT_ID] = cached;
+    return cached;
 }
 
 function saveSettings() {
@@ -830,10 +838,18 @@ async function fetchModelListOnce(custom, silent) {
         // list 已经按「能走 /chat/completions 的排前面」排好
         const models = list.map(m => m.id);
         const noChat = list.filter(m => !supportsChatCompletions(m)).map(m => m.id);
-        const settings = getSettings();
-        const model = pickDefaultModel(models, settings.extract.custom.model, { noChat });
-        settings.extract.custom = { ...settings.extract.custom, models, noChat, model };
+        // 写回时重新取一次设置：await 期间别处可能读过设置，缓存虽然已保证实例稳定，这里再取一次最保险
+        const latest = getSettings();
+        const model = pickDefaultModel(models, latest.extract.custom.model, { noChat });
+        latest.extract.custom = { ...latest.extract.custom, models, noChat, model };
         saveSettings();
+        // 自证：读回来确认真的写进去了。写不进去就是「接口成功但界面空」那类 bug。
+        const written = getSettings().extract.custom.models;
+        if (written.length !== models.length) {
+            console.error(LOG_PREFIX, '模型列表写入设置失败：写入', models.length, '读回', written.length);
+            extractRuntime.modelListError = `拉到 ${models.length} 个模型但没能存进设置（读回 ${written.length} 个），这是个 bug，请把这条报给作者`;
+            return { ok: false, error: extractRuntime.modelListError };
+        }
         extractRuntime.modelListError = null;
         extractRuntime.modelListOk = `成功，${models.length} 个模型`;
         if (!silent) {

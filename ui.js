@@ -540,6 +540,7 @@ function createExtractSection(api, setStatus) {
 
         if (signature !== modelPickerSignature) {
             modelPickerSignature = signature;
+            console.debug('[称呼管理器] 模型下拉渲染：', models.length, '个选项，loading=', state.modelListLoading, '错误=', state.modelListError ?? '无');
 
             modelSelect.textContent = '';
             if (!models.length) {

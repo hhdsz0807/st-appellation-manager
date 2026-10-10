@@ -794,6 +794,71 @@ check('传 null / undefined 也不炸', () => {
     assertEqual(mod.decodeTextBuffer(undefined).text, '');
 });
 
+/* ---------------- 设置对象身份必须稳定 ---------------- */
+
+console.log('\n设置对象稳定性（「接口成功但界面空」的根因）');
+
+check('归一化出来的对象回传时原样返回（store 里放的就是它）', () => {
+    const cache = mod.createSettingsCache();
+    const a = cache.get({ inject: { depth: 3 } });
+    const b = cache.get(a);   // store 里存的就是 a，下一次读必须原样拿回
+    assert(a === b, '回传自己产出的对象必须是同一个实例，否则 await 期间的引用会变孤儿');
+    assertEqual(b.inject.depth, 3, '归一化值要保留');
+});
+check('写回 store 之后再读，拿到的还是同一个实例', () => {
+    // 归一化会造新对象并写回 store，下一次读必须认出它，否则每次读都换实例
+    const store = { settings: undefined };
+    const cache = mod.createSettingsCache();
+    const read = () => {
+        const cached = cache.get(store.settings);
+        if (store.settings !== cached) store.settings = cached;
+        return cached;
+    };
+    const a = read();
+    const b = read();
+    assert(a === b, '第二次读不该再造一个新对象');
+});
+check('外部换了源对象时会重新归一化', () => {
+    const cache = mod.createSettingsCache();
+    const a = cache.get({ inject: { depth: 3 } });
+    const b = cache.get({ inject: { depth: 9 } });
+    assert(a !== b, '换了源对象就该重新归一化');
+    assertEqual(b.inject.depth, 9);
+});
+check('reset 之后重新归一化', () => {
+    const cache = mod.createSettingsCache();
+    const raw = {};
+    const a = cache.get(raw);
+    cache.reset();
+    assert(a !== cache.get(raw), 'reset 后应重新构造');
+});
+check('回归：await 期间别处读过设置，写回的值不会丢', () => {
+    // 复现线上那个 bug：拉取过程中间渲染了一次，设置对象被换掉，写回写到孤儿上
+    const store = { settings: undefined };
+    const cache = mod.createSettingsCache();
+    const readSettings = () => {
+        const cached = cache.get(store.settings);
+        if (store.settings !== cached) store.settings = cached;
+        return cached;
+    };
+
+    const held = readSettings();                    // 拉取开始：抓住引用
+    readSettings();                                 // 拉取途中：别处又读了一次（就是那次渲染）
+
+    held.extract.custom = {                          // 往手里的引用写
+        ...held.extract.custom,
+        baseUrl: 'https://x/v1',
+        model: 'm',
+        apiKey: '',
+        models: ['m1', 'm2'],
+        noChat: [],
+    };
+
+    const seen = readSettings();
+    assertEqual(seen.extract.custom.models, ['m1', 'm2'], '写进去的模型列表必须还能读到');
+    assert(seen === held, '同一份设置应始终是同一个实例');
+});
+
 /* ---------------- 汇总 ---------------- */
 
 console.log(`\n通过 ${passed} 项，失败 ${failures.length} 项`);

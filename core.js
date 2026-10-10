@@ -208,6 +208,36 @@ export function clampInt(value, min, max, fallback) {
 }
 
 /**
+ * 设置对象的稳定缓存。
+ *
+ * 踩过的坑：如果每次读设置都重新归一化出一个新对象，那么任何「先读设置 → await 网络请求 → 写回设置」
+ * 的代码都在往一个已经被换掉的孤儿对象上写。表现就是「接口明明返回成功了，界面上什么都没有」——
+ * 因为写进去的那份根本不在 store 里。
+ *
+ * 所以：同一个源对象在多次读取之间必须返回同一个实例；只有外部真的换了对象才重新归一化。
+ */
+export function createSettingsCache() {
+    let cached = null;
+    return {
+        /**
+         * @param {object} raw store 里当前存放的设置对象；
+         *                    如果它就是上次归一化出来的那个实例，直接原样返回。
+         */
+        get(raw) {
+            // 关键：比的是「我们上次返回的那个对象」，不是「上次传进来的原始对象」。
+            // 归一化之后写回 store 的是新对象，拿原始对象比会永远不相等，结果每次读都重新造一个——
+            // 孤儿引用就是这么产生的。
+            if (cached && raw === cached) return cached;
+            cached = normalizeSettings(raw);
+            return cached;
+        },
+        reset() {
+            cached = null;
+        },
+    };
+}
+
+/**
  * 把文件字节解成文本。
  *
  * 中文小说 txt 十有八九是 GBK / GB18030，直接当 UTF-8 读会整篇乱码（满屏 ），

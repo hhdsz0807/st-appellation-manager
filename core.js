@@ -132,7 +132,7 @@ export function defaultSettings() {
         },
         extract: {
             mode: 'st',          // st=用酒馆当前连接 | custom=直连自定义 OpenAI 兼容端点
-            custom: { baseUrl: '', model: '', apiKey: '', models: [] },
+            custom: { baseUrl: '', model: '', apiKey: '', models: [], noChat: [] },
             chunkChars: EXTRACT_DEFAULTS.chunkChars,
             maxChunks: EXTRACT_DEFAULTS.maxChunks,
             startOffset: EXTRACT_DEFAULTS.startOffset,
@@ -176,6 +176,11 @@ export function normalizeSettings(raw) {
     custom.apiKey = str(custom.apiKey);
     // 从端点 /models 拉回来的候选，缓存下来，省得每次开面板都重新请求
     custom.models = (Array.isArray(custom.models) ? custom.models : [])
+        .map(m => str(m).trim())
+        .filter(Boolean)
+        .slice(0, 500);
+    // 其中明确不支持 /chat/completions 的（比如只支持 /messages 的 Claude 系），别默认选它们
+    custom.noChat = (Array.isArray(custom.noChat) ? custom.noChat : [])
         .map(m => str(m).trim())
         .filter(Boolean)
         .slice(0, 500);

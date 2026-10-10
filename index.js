@@ -48,7 +48,7 @@ import {
     scanCandidates,
     setRelation as setRelationPure,
 } from './core.js';
-import { createCaller, fetchModelList, pickDefaultModel, runExtraction } from './extract.js';
+import { createCaller, fetchModelList, joinModelsUrl, pickDefaultModel, runExtraction, supportsChatCompletions } from './extract.js';
 import { createPanel } from './ui.js';
 
 /** 注入用的键名；酒馆内部用它区分不同扩展的注入内容。 */
@@ -75,6 +75,8 @@ const extractRuntime = {
     running: false,
     abortRequested: false,
     modelListLoading: false,
+    modelListError: null,
+    modelListUrl: '',
     progress: null,
     log: [],
     startedAt: 0,
@@ -396,6 +398,8 @@ const api = {
             sourceName: extractRuntime.sourceNames.get(novelId) ?? '',
             injectNovel: Boolean(settings.extract.injectNovel),
             modelListLoading: extractRuntime.modelListLoading,
+            modelListError: extractRuntime.modelListError,
+            modelListUrl: extractRuntime.modelListUrl,
         };
     },
     getExtractText() {
@@ -434,15 +438,17 @@ const api = {
     },
     setExtractCustom(key, value) {
         const settings = getSettings();
+        const previous = settings.extract.custom?.[key];
         const custom = { ...settings.extract.custom, [key]: value };
-        // 换了端点，之前拉到的模型列表就不作数了。列表由界面层按需重新拉（每个地址只自动试一次）。
-        if (key === 'baseUrl') custom.models = [];
+        // 只有地址真的变了才清空模型列表——否则输入框每次失焦都会把列表清没，用户还得手动重拉
+        if (key === 'baseUrl' && String(previous ?? '') !== String(value ?? '')) custom.models = [];
         settings.extract.custom = custom;
         saveSettings();
     },
     /**
      * 从端点拉模型列表，存进设置里给下拉用。
      * 用户永远不需要手打模型名——填了地址和密钥，这一步自动发生。
+     * 失败原因会留在 modelListError 里，界面上直接显示，不再只闪一下状态栏。
      */
     async refreshModelList({ silent = false } = {}) {
         const settings = getSettings();
@@ -451,19 +457,32 @@ const api = {
             if (!silent) panel?.setStatus('先填端点地址');
             return { ok: false, error: '没填端点地址' };
         }
+        extractRuntime.modelListUrl = joinModelsUrl(custom.baseUrl);
+        extractRuntime.modelListError = null;
         extractRuntime.modelListLoading = true;
         panel?.renderExtract();
         try {
-            const models = await fetchModelList({ baseUrl: custom.baseUrl, apiKey: custom.apiKey });
-            const model = pickDefaultModel(models, settings.extract.custom.model);
-            settings.extract.custom = { ...settings.extract.custom, models, model };
+            const list = await fetchModelList({ baseUrl: custom.baseUrl, apiKey: custom.apiKey });
+            // list 已经按「能走 /chat/completions 的排前面」排好
+            const models = list.map(m => m.id);
+            const noChat = list.filter(m => !supportsChatCompletions(m)).map(m => m.id);
+            const model = pickDefaultModel(models, settings.extract.custom.model, { noChat });
+            settings.extract.custom = { ...settings.extract.custom, models, noChat, model };
             saveSettings();
+            extractRuntime.modelListError = null;
             panel?.renderExtract();
-            if (!silent) panel?.setStatus(`拉到 ${models.length} 个模型，已选「${model}」`);
-            return { ok: true, models, model };
+            if (!silent) {
+                panel?.setStatus(noChat.length
+                    ? `拉到 ${models.length} 个模型（其中 ${noChat.length} 个不支持 /chat/completions），已选「${model}」`
+                    : `拉到 ${models.length} 个模型，已选「${model}」`);
+            }
+            return { ok: true, models, model, noChat };
         } catch (error) {
-            if (!silent) panel?.setStatus(`拉模型列表失败：${error.message}`);
-            return { ok: false, error: error.message };
+            extractRuntime.modelListError = String(error?.message ?? error);
+            console.error(LOG_PREFIX, '拉模型列表失败', extractRuntime.modelListUrl, error);
+            panel?.renderExtract();
+            if (!silent) panel?.setStatus(`拉模型列表失败：${extractRuntime.modelListError}`);
+            return { ok: false, error: extractRuntime.modelListError, url: extractRuntime.modelListUrl };
         } finally {
             extractRuntime.modelListLoading = false;
         }
@@ -619,6 +638,12 @@ const api = {
                 return { started: false, reason: `没法自动确定模型名：${pulled.error}。检查一下端点地址和密钥。` };
             }
             extract = getSettings().extract;
+        }
+        if (extract.mode === 'custom' && extract.custom.noChat?.includes(extract.custom.model)) {
+            return {
+                started: false,
+                reason: `「${extract.custom.model}」在这个端点上不支持 /chat/completions（只支持别的格式），换一个模型。`,
+            };
         }
         if (!activeNovel()) {
             // 没有小说就直接建一部，省掉「先点新建」这一步。

@@ -242,10 +242,19 @@ function createExtractSection(api, setStatus) {
 
     const baseUrlInput = el('input', { type: 'text', id: 'stam-extract-baseurl', placeholder: 'https://api.example.com/v1' });
     baseUrlInput.value = settings0.custom.baseUrl;
-    baseUrlInput.addEventListener('change', () => {
+    let urlCommitTimer = null;
+    const commitBaseUrl = () => {
         api.setExtractCustom('baseUrl', baseUrlInput.value.trim());
-        setStatus('地址变了，正在去拉模型列表…');
         render();
+    };
+    // 输入时也提交（防抖）：不然边敲边看的人会觉得「什么都没发生」
+    baseUrlInput.addEventListener('input', () => {
+        clearTimeout(urlCommitTimer);
+        urlCommitTimer = setTimeout(commitBaseUrl, 700);
+    });
+    baseUrlInput.addEventListener('change', () => {
+        clearTimeout(urlCommitTimer);
+        commitBaseUrl();
     });
 
     const apiKeyInput = el('input', { type: 'password', id: 'stam-extract-apikey', placeholder: 'API Key（明文存在酒馆设置里）', autocomplete: 'off' });
@@ -517,13 +526,17 @@ function createExtractSection(api, setStatus) {
         const current = settings.custom.model ?? '';
 
         modelSelect.textContent = '';
+        const noChat = new Set(settings.custom.noChat ?? []);
         if (!models.length) {
             modelSelect.append(el('option', { value: '', text: state.modelListLoading ? '正在拉取…' : '（先填地址和密钥）' }));
             modelSelect.disabled = true;
         } else {
             modelSelect.disabled = false;
             for (const id of models) {
-                modelSelect.append(el('option', { value: id, text: id }));
+                modelSelect.append(el('option', {
+                    value: id,
+                    text: noChat.has(id) ? `${id}（不支持 /chat/completions）` : id,
+                }));
             }
             if (current && !models.includes(current)) {
                 modelSelect.append(el('option', { value: current, text: `${current}（已不在列表里）` }));
@@ -537,9 +550,38 @@ function createExtractSection(api, setStatus) {
         if (needFallback) modelFallbackInput.value = current;
 
         refreshModelsBtn.disabled = state.modelListLoading || !settings.custom.baseUrl;
-        modelHint.textContent = models.length
-            ? `端点返回 ${models.length} 个模型。换了地址会自动重新拉。`
-            : (state.modelListLoading ? '' : '填完端点地址和密钥会自动拉取模型列表；拉不到就在下面手填。');
+
+        // 失败原因直接摆在这里，别只闪一下底部状态栏
+        modelHint.textContent = '';
+        if (state.modelListError) {
+            modelHint.append(el('div', { class: 'stam-error', text: `拉取失败：${state.modelListError}` }));
+            if (state.modelListUrl) {
+                modelHint.append(el('div', { class: 'stam-hint', text: `试的地址：${state.modelListUrl}` }));
+            }
+            if (/连不上|Failed to fetch|NetworkError|Network Error/i.test(state.modelListError)) {
+                modelHint.append(el('div', {
+                    class: 'stam-hint',
+                    text: '浏览器压根没发出请求：多半是跨域被拦、广告拦截插件，或网络不通。改成「酒馆当前连接」就不存在跨域这回事。',
+                }));
+            } else if (/HTTP 401|HTTP 403/.test(state.modelListError)) {
+                modelHint.append(el('div', { class: 'stam-hint', text: '接口拒绝了这个密钥，检查一下 API Key 有没有填全、要不要带前缀。' }));
+            } else if (/HTTP 404/.test(state.modelListError)) {
+                modelHint.append(el('div', { class: 'stam-hint', text: '这个地址下没有 /models 接口。确认地址填到哪一层（例如是否少了 /v1）。' }));
+            } else if (/不是 JSON/.test(state.modelListError)) {
+                modelHint.append(el('div', { class: 'stam-hint', text: '地址可能填多了或填少了。一般填到 /v1 这一层就行。' }));
+            }
+            modelHint.append(el('div', { class: 'stam-hint', text: '也可以在下面直接手填模型名先跑起来。' }));
+        } else if (models.length) {
+            const blocked = (settings.custom.noChat ?? []).length;
+            modelHint.append(el('div', {
+                class: 'stam-hint',
+                text: `端点返回 ${models.length} 个模型${blocked ? `，其中 ${blocked} 个不支持 /chat/completions（已标注，别选）` : ''}。改了地址会自动重新拉。`,
+            }));
+        } else if (state.modelListLoading) {
+            modelHint.append(el('div', { class: 'stam-hint', text: '正在拉取模型列表…' }));
+        } else {
+            modelHint.append(el('div', { class: 'stam-hint', text: '填完端点地址和密钥会自动拉取模型列表；拉不到就在下面手填。' }));
+        }
     }
 
     function updatePlan() {

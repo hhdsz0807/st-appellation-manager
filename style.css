@@ -238,6 +238,13 @@
     opacity: 0.72;
 }
 
+#stam-panel .stam-error {
+    font-size: 0.82em;
+    color: var(--SmartThemeQuoteColor, #d9705c);
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
 #stam-panel .stam-status {
     font-size: 0.85em;
     opacity: 0.85;

@@ -39,23 +39,44 @@ export function joinModelsUrl(baseUrl) {
 }
 
 /**
- * 从各家五花八门的 /models 响应里挖出模型 id 列表。
+ * 从各家五花八门的 /models 响应里挖出模型信息。
  * OpenAI / vLLM / Ollama / LM Studio / one-api 的字段名都不一样，这里都认。
+ * 有的供应商还会报 supported_endpoints（比如只支持 /messages 的 Claude 系），一并带出来。
  */
-export function pickModelIds(data) {
+export function parseModelList(data) {
     const list = Array.isArray(data)
         ? data
         : (Array.isArray(data?.data) ? data.data
             : (Array.isArray(data?.models) ? data.models : []));
-    const ids = [];
+    const out = [];
+    const seen = new Set();
     for (const entry of list) {
         const id = typeof entry === 'string'
             ? entry
             : (entry?.id ?? entry?.name ?? entry?.model ?? entry?.model_name);
         const clean = String(id ?? '').trim();
-        if (clean && !ids.includes(clean)) ids.push(clean);
+        if (!clean || seen.has(clean)) continue;
+        seen.add(clean);
+        const endpoints = Array.isArray(entry?.supported_endpoints)
+            ? entry.supported_endpoints.map(e => String(e))
+            : null;
+        out.push({ id: clean, endpoints });
     }
-    return ids.sort((a, b) => a.localeCompare(b, 'en'));
+    return out;
+}
+
+/** 只要模型 id，按字母序。 */
+export function pickModelIds(data) {
+    return parseModelList(data).map(m => m.id).sort((a, b) => a.localeCompare(b, 'en'));
+}
+
+/**
+ * 这个模型能不能走 OpenAI 的 /chat/completions。
+ * 供应商没报端点信息的按「能」算——不误伤大多数不报这个字段的接口。
+ */
+export function supportsChatCompletions(model) {
+    if (!model?.endpoints?.length) return true;
+    return model.endpoints.some(e => /chat\/completions/i.test(e));
 }
 
 /** 拉取端点支持的模型列表。fetchImpl 可注入，方便离线测。 */
@@ -65,46 +86,73 @@ export async function fetchModelList({ baseUrl, apiKey, fetchImpl, signal } = {}
     const doFetch = fetchImpl ?? globalThis.fetch;
     if (typeof doFetch !== 'function') throw new Error('当前环境没有 fetch');
 
-    const response = await doFetch(url, {
-        method: 'GET',
-        headers: {
-            Accept: 'application/json',
-            ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
-        },
-        signal,
-    });
+    let response;
+    try {
+        response = await doFetch(url, {
+            method: 'GET',
+            headers: {
+                Accept: 'application/json',
+                ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+            },
+            signal,
+        });
+    } catch (error) {
+        // 浏览器在这里抛 Failed to fetch 时，HTTP 层根本没过——多半是跨域被拦、被插件拦、或网络不通
+        throw new Error(`连不上 ${url}（网络层就失败了：${error?.message ?? error}）。常见原因是跨域被拦、广告拦截插件、或网络不通。`);
+    }
+
     if (!response.ok) {
         const detail = String(await response.text().catch(() => '')).slice(0, 200);
-        throw new Error(`模型列表接口返回 HTTP ${response.status}${detail ? `：${detail}` : ''}`);
+        throw new Error(`${url} 返回 HTTP ${response.status}${detail ? `：${detail}` : ''}`);
     }
-    const ids = pickModelIds(await response.json());
-    if (!ids.length) throw new Error('模型列表接口没有返回任何模型');
-    return ids;
+    let data;
+    try {
+        data = await response.json();
+    } catch {
+        throw new Error(`${url} 返回的不是 JSON，这个地址可能不是 OpenAI 兼容的接口根路径`);
+    }
+    const models = parseModelList(data);
+    if (!models.length) {
+        throw new Error(`${url} 没有返回任何模型（响应里找不到 data[].id 之类的字段）`);
+    }
+    // 能走 /chat/completions 的排前面——默认要选的是它们
+    return [...models].sort((a, b) =>
+        Number(supportsChatCompletions(b)) - Number(supportsChatCompletions(a))
+        || a.id.localeCompare(b.id, 'en'));
 }
 
 /**
- * 拉完列表后决定选哪个：能保留就保留，否则只有唯一模型就用它，再否则用第一个。
- * 这样用户最多只需要点一次「刷新」，不用手打。
+ * 拉完列表后决定选哪个：能保留就保留，否则挑第一个能用的。
+ * noChat 里是本端点明确不支持 /chat/completions 的模型，不能默认选它们。
  */
-export function pickDefaultModel(models, current) {
+export function pickDefaultModel(models, current, { noChat = [] } = {}) {
     const list = Array.isArray(models) ? models : [];
+    const blocked = new Set(noChat ?? []);
     const kept = String(current ?? '').trim();
+    if (kept && list.includes(kept) && !blocked.has(kept)) return kept;
+    const firstUsable = list.find(id => !blocked.has(id));
+    if (firstUsable) return firstUsable;
     if (kept && list.includes(kept)) return kept;
-    if (list.length) return list[0];
-    return kept;
+    return kept || list[0] || '';
 }
 
 /** 从 OpenAI 兼容响应里取正文；结构不对就抛出可读错误。 */
 export function pickChatCompletionContent(data) {
     const content = data?.choices?.[0]?.message?.content;
-    if (typeof content === 'string') return content;
+    if (typeof content === 'string' && content.trim()) return content;
     // 有些端点把内容拆成数组（多模态格式）
     if (Array.isArray(content)) {
         const joined = content.map(part => (typeof part === 'string' ? part : part?.text ?? '')).join('');
         if (joined.trim()) return joined;
     }
     const legacy = data?.choices?.[0]?.text;
-    if (typeof legacy === 'string') return legacy;
+    if (typeof legacy === 'string' && legacy.trim()) return legacy;
+
+    // 内容为空但只有思考内容：多半是推理模型把预算花在思考上被截断了
+    const reasoning = data?.choices?.[0]?.message?.reasoning_content ?? data?.choices?.[0]?.message?.reasoning;
+    if (typeof reasoning === 'string' && reasoning.trim()) {
+        throw new Error('模型只吐出了思考内容，正式回答被长度限制截断了。换个非推理模型，或把「每块字数」调小让回复短一点。');
+    }
     throw new Error('返回结构里找不到 choices[0].message.content');
 }
 

@@ -13,10 +13,12 @@ import {
     fetchModelList,
     joinChatCompletionsUrl,
     joinModelsUrl,
+    parseModelList,
     pickChatCompletionContent,
     pickDefaultModel,
     pickModelIds,
     runExtraction,
+    supportsChatCompletions,
 } from './extract.js';
 import { autoMapNames, buildParticipants, collectNames, mergeExtractResults } from './core.js';
 
@@ -141,7 +143,7 @@ await check('fetchModelList 带上 Bearer 并发 GET', async () => {
     assertEqual(seen.url, 'https://api.example.com/v1/models');
     assertEqual(seen.init.method, 'GET');
     assertEqual(seen.init.headers.Authorization, 'Bearer sk-x');
-    assertEqual(models, ['m1', 'm2']);
+    assertEqual(models.map(m => m.id), ['m1', 'm2']);
 });
 await check('fetchModelList 的错误带状态码和响应片段', async () => {
     let message = '';
@@ -155,6 +157,33 @@ await check('fetchModelList 的错误带状态码和响应片段', async () => {
     }
     assertIncludes(message, '404');
     assertIncludes(message, 'not found');
+    assertIncludes(message, 'https://x/v1/models', '报错里要说清试的是哪个地址');
+});
+await check('网络层失败（浏览器跨域被拦）给出人能看懂的提示', async () => {
+    let message = '';
+    try {
+        await fetchModelList({
+            baseUrl: 'https://x/v1',
+            fetchImpl: async () => { throw new TypeError('Failed to fetch'); },
+        });
+    } catch (error) {
+        message = error.message;
+    }
+    assertIncludes(message, '连不上');
+    assertIncludes(message, 'Failed to fetch');
+    assertIncludes(message, '跨域');
+});
+await check('返回不是 JSON 时提示地址可能填错层级', async () => {
+    let message = '';
+    try {
+        await fetchModelList({
+            baseUrl: 'https://x/v1',
+            fetchImpl: async () => ({ ok: true, status: 200, json: async () => { throw new Error('not json'); }, text: async () => '<html>hi</html>' }),
+        });
+    } catch (error) {
+        message = error.message;
+    }
+    assertIncludes(message, '不是 JSON');
 });
 await check('没填地址直接报错，不发请求', async () => {
     let threw = false;
@@ -183,6 +212,47 @@ await check('自动选模型：能保留就保留，否则用列表第一个', (
     assertEqual(pickDefaultModel(['a', 'b'], 'z'), 'a', '已不在列表里就退回第一个');
     assertEqual(pickDefaultModel(['only'], ''), 'only');
     assertEqual(pickDefaultModel([], 'kept'), 'kept', '拉不到列表时不要清掉已有值');
+});
+await check('明知不支持 /chat/completions 的模型不会被默认选中', () => {
+    // 真实场景：commandcode 那种端点，字母序第一个恰好是只支持 /messages 的 Claude
+    const models = ['claude-fable-5', 'deepseek/deepseek-v4-flash', 'gpt-5.5'];
+    const noChat = ['claude-fable-5'];
+    assertEqual(pickDefaultModel(models, '', { noChat }), 'deepseek/deepseek-v4-flash');
+    assertEqual(pickDefaultModel(models, 'claude-fable-5', { noChat }), 'deepseek/deepseek-v4-flash',
+        '上次自动选错了，这次要改过来');
+    assertEqual(pickDefaultModel(models, 'gpt-5.5', { noChat }), 'gpt-5.5', '用户自己选的可用模型要尊重');
+    assertEqual(pickDefaultModel(['claude-fable-5'], 'claude-fable-5', { noChat }), 'claude-fable-5',
+        '全是不可用的，那就还留着，别清空');
+});
+await check('supported_endpoints 能识别出来', () => {
+    const list = parseModelList({
+        data: [
+            { id: 'claude-sonnet-5', supported_endpoints: ['/messages'] },
+            { id: 'gpt-5.5', supported_endpoints: ['/messages', '/chat/completions'] },
+            { id: 'no-info' },
+        ],
+    });
+    assertEqual(list.length, 3);
+    assertEqual(supportsChatCompletions(list[0]), false, '只支持 /messages 的不该算可用');
+    assertEqual(supportsChatCompletions(list[1]), true);
+    assertEqual(supportsChatCompletions(list[2]), true, '没报端点的按可用算，不误伤');
+});
+await check('拉到的列表把可用的排在前面', async () => {
+    const list = await fetchModelList({
+        baseUrl: 'https://x/v1',
+        fetchImpl: async () => ({
+            ok: true,
+            status: 200,
+            text: async () => '',
+            json: async () => ({
+                data: [
+                    { id: 'aaa-claude', supported_endpoints: ['/messages'] },
+                    { id: 'zzz-gpt', supported_endpoints: ['/chat/completions'] },
+                ],
+            }),
+        }),
+    });
+    assertEqual(list.map(m => m.id), ['zzz-gpt', 'aaa-claude'], '可用的要排前面，哪怕字母序靠后');
 });
 
 /* ---------------- 自定义端点调用器 ---------------- */

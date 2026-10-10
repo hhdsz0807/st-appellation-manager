@@ -234,6 +234,33 @@ export function createCaller(extract, host, opts = {}) {
 export const CONSECUTIVE_FAILURE_LIMIT = 2;
 
 /**
+ * 单飞：同一件事在飞的时候，后来的调用复用同一个 Promise。
+ *
+ * 拉模型列表必须用它——连点「重新拉取」或者自动+手动叠在一起，
+ * 会同时发好几个请求、每个回来都重渲染一次，界面上看起来就是不停闪。
+ */
+export function createSingleFlight() {
+    let inFlight = null;
+    return {
+        get busy() {
+            return inFlight !== null;
+        },
+        run(task) {
+            if (inFlight) return inFlight;
+            const promise = (async () => {
+                try {
+                    return await task();
+                } finally {
+                    inFlight = null;
+                }
+            })();
+            inFlight = promise;
+            return promise;
+        },
+    };
+}
+
+/**
  * 跑一轮提取。
  * @param {object} params
  * @param {string} params.text 正文

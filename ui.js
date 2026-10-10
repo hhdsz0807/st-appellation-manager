@@ -275,10 +275,11 @@ function createExtractSection(api, setStatus) {
     const modelFallbackField = el('div', { class: 'stam-field', id: 'stam-model-fallback' }, [modelFallbackInput]);
 
     const refreshModelsBtn = button('重新拉取', async () => {
-        refreshModelsBtn.disabled = true;
-        await api.refreshModelList();
-        refreshModelsBtn.disabled = false;
-        render();
+        // 手动拉过了就记下来，别让自动逻辑再补发一次——一次点击两次请求、画面连闪就是那么来的
+        autoFetchedFor = api.getExtractSettings().custom.baseUrl || null;
+        const result = await api.refreshModelList();
+        renderModels();
+        if (!result.ok) setStatus(`拉模型列表失败：${result.error}`);
     });
     const modelHint = el('div', { class: 'stam-hint', id: 'stam-model-hint' });
 
@@ -517,71 +518,87 @@ function createExtractSection(api, setStatus) {
         // 每个地址只自动试一次：失败了也不反复重试，想再试就点「重新拉取」
         if (autoFetchedFor === url) return;
         autoFetchedFor = url;
-        api.refreshModelList({ silent: true }).finally(() => render());
+        api.refreshModelList({ silent: true }).finally(() => renderModels());
     }
+
+    /**
+     * 模型下拉只在「内容真的变了」时才重建。
+     * 每帧拆了重画会让下拉不停闪，而且用户正在展开选择时会被打断。
+     */
+    let modelPickerSignature = null;
 
     function renderModelPicker(state) {
         const settings = api.getExtractSettings();
         const models = settings.custom.models ?? [];
+        const noChat = new Set(settings.custom.noChat ?? []);
         const current = settings.custom.model ?? '';
 
-        modelSelect.textContent = '';
-        const noChat = new Set(settings.custom.noChat ?? []);
-        if (!models.length) {
-            modelSelect.append(el('option', { value: '', text: state.modelListLoading ? '正在拉取…' : '（先填地址和密钥）' }));
-            modelSelect.disabled = true;
-        } else {
-            modelSelect.disabled = false;
-            for (const id of models) {
-                modelSelect.append(el('option', {
-                    value: id,
-                    text: noChat.has(id) ? `${id}（不支持 /chat/completions）` : id,
-                }));
-            }
-            if (current && !models.includes(current)) {
-                modelSelect.append(el('option', { value: current, text: `${current}（已不在列表里）` }));
-            }
-            modelSelect.value = current || models[0];
-        }
+        const signature = JSON.stringify([
+            models, [...noChat].sort(), current,
+            Boolean(state.modelListLoading), state.modelListError ?? '', state.modelListUrl ?? '',
+        ]);
 
-        // 端点没有 /models 接口时才需要手填，平时这个框藏起来
-        const needFallback = !models.length && !state.modelListLoading && Boolean(settings.custom.baseUrl);
-        modelFallbackField.style.display = needFallback ? '' : 'none';
-        if (needFallback) modelFallbackInput.value = current;
+        if (signature !== modelPickerSignature) {
+            modelPickerSignature = signature;
 
-        refreshModelsBtn.disabled = state.modelListLoading || !settings.custom.baseUrl;
-
-        // 失败原因直接摆在这里，别只闪一下底部状态栏
-        modelHint.textContent = '';
-        if (state.modelListError) {
-            modelHint.append(el('div', { class: 'stam-error', text: `拉取失败：${state.modelListError}` }));
-            if (state.modelListUrl) {
-                modelHint.append(el('div', { class: 'stam-hint', text: `试的地址：${state.modelListUrl}` }));
+            modelSelect.textContent = '';
+            if (!models.length) {
+                modelSelect.append(el('option', { value: '', text: state.modelListLoading ? '正在拉取…' : '（先填地址和密钥）' }));
+                modelSelect.disabled = true;
+            } else {
+                modelSelect.disabled = false;
+                for (const id of models) {
+                    modelSelect.append(el('option', {
+                        value: id,
+                        text: noChat.has(id) ? `${id}（不支持 /chat/completions）` : id,
+                    }));
+                }
+                if (current && !models.includes(current)) {
+                    modelSelect.append(el('option', { value: current, text: `${current}（已不在列表里）` }));
+                }
+                modelSelect.value = current || models[0];
             }
-            if (/连不上|Failed to fetch|NetworkError|Network Error/i.test(state.modelListError)) {
+
+            // 端点没有 /models 接口时才需要手填，平时这个框藏起来
+            const needFallback = !models.length && !state.modelListLoading && Boolean(settings.custom.baseUrl);
+            modelFallbackField.style.display = needFallback ? '' : 'none';
+            if (needFallback) modelFallbackInput.value = current;
+
+            // 失败/成功原因直接摆在这里，别只闪一下底部状态栏
+            modelHint.textContent = '';
+            if (state.modelListError) {
+                modelHint.append(el('div', { class: 'stam-error', text: `拉取失败：${state.modelListError}` }));
+                if (state.modelListUrl) {
+                    modelHint.append(el('div', { class: 'stam-hint', text: `试的地址：${state.modelListUrl}` }));
+                }
+                if (/连不上|Failed to fetch|NetworkError|Network Error/i.test(state.modelListError)) {
+                    modelHint.append(el('div', {
+                        class: 'stam-hint',
+                        text: '浏览器压根没发出请求：多半是跨域被拦、广告拦截插件，或网络不通。改成「酒馆当前连接」就不存在跨域这回事。',
+                    }));
+                } else if (/HTTP 401|HTTP 403/.test(state.modelListError)) {
+                    modelHint.append(el('div', { class: 'stam-hint', text: '接口拒绝了这个密钥，检查一下 API Key 有没有填全、要不要带前缀。' }));
+                } else if (/HTTP 404/.test(state.modelListError)) {
+                    modelHint.append(el('div', { class: 'stam-hint', text: '这个地址下没有 /models 接口。确认地址填到哪一层（例如是否少了 /v1）。' }));
+                } else if (/不是 JSON/.test(state.modelListError)) {
+                    modelHint.append(el('div', { class: 'stam-hint', text: '地址可能填多了或填少了。一般填到 /v1 这一层就行。' }));
+                }
+                modelHint.append(el('div', { class: 'stam-hint', text: '也可以在下面直接手填模型名先跑起来。' }));
+            } else if (models.length) {
+                const blocked = noChat.size;
                 modelHint.append(el('div', {
                     class: 'stam-hint',
-                    text: '浏览器压根没发出请求：多半是跨域被拦、广告拦截插件，或网络不通。改成「酒馆当前连接」就不存在跨域这回事。',
+                    text: `上次拉取：${state.modelListOk || `成功，${models.length} 个模型`}${blocked ? `；${blocked} 个不支持 /chat/completions（已标注，别选）` : ''}。改了地址会自动重新拉。`,
                 }));
-            } else if (/HTTP 401|HTTP 403/.test(state.modelListError)) {
-                modelHint.append(el('div', { class: 'stam-hint', text: '接口拒绝了这个密钥，检查一下 API Key 有没有填全、要不要带前缀。' }));
-            } else if (/HTTP 404/.test(state.modelListError)) {
-                modelHint.append(el('div', { class: 'stam-hint', text: '这个地址下没有 /models 接口。确认地址填到哪一层（例如是否少了 /v1）。' }));
-            } else if (/不是 JSON/.test(state.modelListError)) {
-                modelHint.append(el('div', { class: 'stam-hint', text: '地址可能填多了或填少了。一般填到 /v1 这一层就行。' }));
+            } else if (state.modelListLoading) {
+                modelHint.append(el('div', { class: 'stam-hint', text: '正在拉取模型列表…' }));
+            } else {
+                modelHint.append(el('div', { class: 'stam-hint', text: '填完端点地址和密钥会自动拉取模型列表；拉不到就在下面手填。' }));
             }
-            modelHint.append(el('div', { class: 'stam-hint', text: '也可以在下面直接手填模型名先跑起来。' }));
-        } else if (models.length) {
-            const blocked = (settings.custom.noChat ?? []).length;
-            modelHint.append(el('div', {
-                class: 'stam-hint',
-                text: `端点返回 ${models.length} 个模型${blocked ? `，其中 ${blocked} 个不支持 /chat/completions（已标注，别选）` : ''}。改了地址会自动重新拉。`,
-            }));
-        } else if (state.modelListLoading) {
-            modelHint.append(el('div', { class: 'stam-hint', text: '正在拉取模型列表…' }));
-        } else {
-            modelHint.append(el('div', { class: 'stam-hint', text: '填完端点地址和密钥会自动拉取模型列表；拉不到就在下面手填。' }));
         }
+
+        refreshModelsBtn.disabled = state.modelListLoading || !settings.custom.baseUrl;
+        refreshModelsBtn.textContent = state.modelListLoading ? '拉取中…' : '重新拉取';
     }
 
     function updatePlan() {
@@ -763,6 +780,11 @@ function createExtractSection(api, setStatus) {
         }
     }
 
+    /** 只刷模型那一小块。拉模型列表前后用这个，不要用 render()。 */
+    function renderModels() {
+        renderModelPicker(api.getExtractUiState());
+    }
+
     function render() {
         const state = api.getExtractUiState();
         syncMode();
@@ -799,7 +821,7 @@ function createExtractSection(api, setStatus) {
 
     syncMode();
     render();
-    return { root, render };
+    return { root, render, renderModels };
 }
 
 export function createPanel(api) {
@@ -1239,7 +1261,14 @@ export function createPanel(api) {
     }
 
     render();
-    return { root, render, renderLight, renderExtract: extractSection.render, setStatus };
+    return {
+        root,
+        render,
+        renderLight,
+        renderExtract: extractSection.render,
+        renderModels: extractSection.renderModels,
+        setStatus,
+    };
 }
 
 export default createPanel;

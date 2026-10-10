@@ -9,6 +9,7 @@ import {
     CONSECUTIVE_FAILURE_LIMIT,
     createCaller,
     createCustomCaller,
+    createSingleFlight,
     createStCaller,
     fetchModelList,
     joinChatCompletionsUrl,
@@ -468,6 +469,66 @@ await check('跑完之后能直接接上映射和落表（端到端）', async (
     assertEqual(mapping['星野'], 'char:xingye.png');
     assertEqual(mapping['小陆'], '__user__', '「小陆」正好是用户 persona 的名字，应映射到用户');
     assertEqual(mapping['老王'], null, '当前聊天里没有老王，应留空而不是硬塞给谁');
+});
+
+/* ---------------- 单飞（修「不停闪烁」的那把锁） ---------------- */
+
+console.log('\n单飞闸门');
+
+await check('并发调用只会真的跑一次，后来者复用同一个 Promise', async () => {
+    const flight = createSingleFlight();
+    let calls = 0;
+    const task = async () => {
+        calls += 1;
+        await new Promise(resolve => setTimeout(resolve, 20));
+        return calls;
+    };
+    const [a, b, c] = await Promise.all([flight.run(task), flight.run(task), flight.run(task)]);
+    assertEqual(calls, 1, '三次并发只该发一次');
+    assertEqual([a, b, c], [1, 1, 1], '三者应拿到同一个结果');
+});
+await check('跑完之后闸门打开，下一次能正常再跑', async () => {
+    const flight = createSingleFlight();
+    let calls = 0;
+    const task = async () => { calls += 1; return calls; };
+    assertEqual(await flight.run(task), 1);
+    assertEqual(await flight.run(task), 2);
+    assertEqual(calls, 2);
+});
+await check('busy 能反映在飞状态', async () => {
+    const flight = createSingleFlight();
+    assertEqual(flight.busy, false);
+    let release;
+    const pending = flight.run(() => new Promise(resolve => { release = resolve; }));
+    assertEqual(flight.busy, true, '在飞的时候 busy 应为 true');
+    release('done');
+    await pending;
+    assertEqual(flight.busy, false, '结束后应恢复');
+});
+await check('任务抛错时闸门也会打开，不会被永久锁死', async () => {
+    const flight = createSingleFlight();
+    let message = '';
+    try {
+        await flight.run(async () => { throw new Error('接口挂了'); });
+    } catch (error) {
+        message = error.message;
+    }
+    assertIncludes(message, '接口挂了');
+    assertEqual(flight.busy, false);
+    assertEqual(await flight.run(async () => 'recovered'), 'recovered');
+});
+await check('连着点十次「重新拉取」也只发一次请求（就是闪烁的根因）', async () => {
+    const flight = createSingleFlight();
+    let calls = 0;
+    const task = async () => {
+        calls += 1;
+        await new Promise(resolve => setTimeout(resolve, 10));
+        return ['m1', 'm2'];
+    };
+    const results = [];
+    for (let i = 0; i < 10; i += 1) results.push(flight.run(task));
+    await Promise.all(results);
+    assertEqual(calls, 1, `十次点击只该发一次，实际 ${calls} 次`);
 });
 
 /* ---------------- 汇总 ---------------- */

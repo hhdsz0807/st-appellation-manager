@@ -825,6 +825,132 @@ function createExtractSection(api, setStatus) {
     return { root, render, renderModels };
 }
 
+/**
+ * 总开关 + 自动维护区块。
+ * 总开关默认关闭：关着的时候不注入、不自动更新、不自动回滚。
+ */
+function createAutoSection(api, setStatus) {
+    /* ---------- 总开关 ---------- */
+
+    const enableCheck = el('input', { type: 'checkbox', id: 'stam-enabled' });
+    enableCheck.addEventListener('change', () => {
+        api.setEnabled(enableCheck.checked);
+        setStatus(enableCheck.checked
+            ? '已开启：会注入称呼表，并可能按设置自动维护'
+            : '已关闭：不再注入任何内容，也不会自动改称呼');
+    });
+
+    const masterState = el('span', { class: 'stam-master-state' });
+    const masterBox = el('div', { class: 'stam-master', id: 'stam-master' }, [
+        el('label', { class: 'stam-check' }, [enableCheck, el('span', { class: 'stam-master-title', text: '启用称呼管理器' })]),
+        masterState,
+        el('div', {
+            class: 'stam-hint',
+            text: '关闭时：不向模型注入称呼表、不按楼层自动更新、不自动回滚。面板里的手工编辑和「从正文提取」不受影响。',
+        }),
+    ]);
+
+    /* ---------- 自动维护设置 ---------- */
+
+    const autoCheck = el('input', { type: 'checkbox', id: 'stam-auto-enabled' });
+    autoCheck.addEventListener('change', () => {
+        api.setAutoOption('enabled', autoCheck.checked);
+        setStatus(autoCheck.checked ? '自动维护已开' : '自动维护已关');
+    });
+
+    const everyNInput = el('input', { type: 'number', min: '1', max: '200', step: '1', id: 'stam-auto-everyn' });
+    everyNInput.addEventListener('change', () => api.setAutoOption('everyN', Number(everyNInput.value)));
+
+    const lookbackInput = el('input', { type: 'number', min: '1', max: '500', step: '1', id: 'stam-auto-lookback' });
+    lookbackInput.addEventListener('change', () => api.setAutoOption('lookback', Number(lookbackInput.value)));
+
+    const confidenceInput = el('input', { type: 'number', min: '0', max: '1', step: '0.1', id: 'stam-auto-confidence' });
+    confidenceInput.addEventListener('change', () => api.setAutoOption('minConfidence', Number(confidenceInput.value)));
+
+    const maxPerRunInput = el('input', { type: 'number', min: '1', max: '100', step: '1', id: 'stam-auto-max' });
+    maxPerRunInput.addEventListener('change', () => api.setAutoOption('maxPerRun', Number(maxPerRunInput.value)));
+
+    const autoStatus = el('div', { class: 'stam-hint', id: 'stam-auto-status' });
+    const journalBox = el('div', { class: 'stam-journal' });
+
+    const autoBody = el('div', { class: 'stam-auto-body' }, [
+        el('div', { class: 'stam-hint', text: '用本地扫描（不调模型、不花钱）读最近若干楼，把「谁开始这么叫谁了」补进称呼表。依据的楼层会记下来，删楼时连带回滚。' }),
+        el('div', { class: 'stam-checks' }, [
+            el('label', { class: 'stam-check' }, [autoCheck, el('span', { text: '开启按楼层自动更新' })]),
+        ]),
+        el('div', { class: 'stam-grid' }, [
+            field('每几条角色回复更新', everyNInput),
+            field('依据最近几楼', lookbackInput),
+            field('置信度门槛', confidenceInput, '0–1，越高越保守'),
+            field('一次最多改几条', maxPerRunInput),
+        ]),
+        el('div', { class: 'stam-toolbar' }, [
+            button('立刻更新一次', () => {
+                const result = api.runAutoUpdateNow();
+                setStatus(result.applied
+                    ? `更新了 ${result.applied} 条称呼（扫到 ${result.candidates} 条候选，跳过 ${result.skipped} 条）`
+                    : `没有可写的变化（扫到 ${result?.candidates ?? 0} 条候选${result?.skipped ? `，跳过 ${result.skipped} 条` : ''}）`);
+                render();
+            }),
+            button('清空自动更新记录', () => {
+                if (!window.confirm('清空记录只会忘掉「哪条称呼是自动写的」，已经写进关系表的称呼不会变。继续？')) return;
+                const count = api.clearJournal();
+                setStatus(`已清空 ${count} 条自动更新记录`);
+                render();
+            }),
+        ]),
+        autoStatus,
+        journalBox,
+    ]);
+
+    const root = el('fieldset', { class: 'stam-box', id: 'stam-auto-box' }, [
+        el('legend', { text: '自动维护' }),
+        autoBody,
+    ]);
+
+    /* ---------- 渲染 ---------- */
+
+    function render() {
+        const state = api.getAutoUiState();
+        enableCheck.checked = state.enabled;
+        masterState.textContent = state.enabled ? '当前：已开启' : '当前：已关闭（装好后默认就是关的）';
+        masterBox.classList.toggle('stam-master-off', !state.enabled);
+
+        autoCheck.checked = state.auto.enabled;
+        if (document.activeElement !== everyNInput) everyNInput.value = String(state.auto.everyN);
+        if (document.activeElement !== lookbackInput) lookbackInput.value = String(state.auto.lookback);
+        if (document.activeElement !== confidenceInput) confidenceInput.value = String(state.auto.minConfidence);
+        if (document.activeElement !== maxPerRunInput) maxPerRunInput.value = String(state.auto.maxPerRun);
+
+        autoBody.style.opacity = state.enabled ? '' : '0.6';
+        const lastRun = state.lastRunAt ? new Date(state.lastRunAt).toLocaleTimeString('zh-CN') : '还没跑过';
+        autoStatus.textContent = state.enabled
+            ? `已收到 ${state.assistantCount} 条角色回复，距上次更新 ${state.sinceLastRun} 条（每 ${state.auto.everyN} 条跑一次）；上次更新：${lastRun}`
+            : '总开关关着，自动维护不会运行。';
+
+        journalBox.textContent = '';
+        if (!state.journalTotal) return;
+        journalBox.append(el('div', { class: 'stam-subtitle', text: `自动更新记录（${state.journalTotal} 条，显示最近 ${state.journal.length} 条）` }));
+        for (const entry of state.journal) {
+            journalBox.append(el('div', { class: 'stam-journal-row' }, [
+                el('div', { class: 'stam-journal-main' }, [
+                    el('span', { text: `${entry.label}：` }),
+                    el('strong', { text: entry.call }),
+                    el('span', { class: 'stam-hint', text: `  原：${entry.before}` }),
+                ]),
+                el('div', { class: 'stam-hint', text: `依据楼层：${entry.floor}…` }),
+                button('撤销这条', () => {
+                    const result = api.revertAutoEntry(entry.id);
+                    setStatus(result.ok ? `已撤销「${entry.call}」` : (result.reason ?? '撤销失败'));
+                    render();
+                }, 'stam-small'),
+            ]));
+        }
+    }
+
+    return { root, render };
+}
+
 export function createPanel(api) {
     const state = {
         collapsed: false,
@@ -967,8 +1093,10 @@ export function createPanel(api) {
     /* ---------------- 组装 ---------------- */
 
     const extractSection = createExtractSection(api, setStatus);
+    const autoSection = createAutoSection(api, setStatus);
 
     const content = el('div', { class: 'stam-content' }, [
+        autoSection.root,
         extractSection.root,
         injectBox,
         el('fieldset', { class: 'stam-box' }, [
@@ -1247,6 +1375,7 @@ export function createPanel(api) {
         renderCandidates();
         renderIssues();
         extractSection.render();
+        autoSection.render();
         filterBar.querySelectorAll('.stam-chip').forEach(chip => {
             chip.classList.toggle('stam-chip-active', chip.dataset.filter === state.filter);
         });
@@ -1259,6 +1388,7 @@ export function createPanel(api) {
     function renderLight() {
         renderInject();
         extractSection.render();
+        autoSection.render();
     }
 
     render();

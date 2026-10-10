@@ -859,6 +859,263 @@ check('回归：await 期间别处读过设置，写回的值不会丢', () => {
     assert(seen === held, '同一份设置应始终是同一个实例');
 });
 
+/* ---------------- 自动维护：按楼层更新 + 删楼级联回滚 ---------------- */
+
+console.log('\n楼层身份与快照');
+
+const FLOOR = (text, date) => ({ mes: text, send_date: date, is_user: false, name: '白鹭' });
+
+check('消息身份 = send_date + 正文前 60 字', () => {
+    const ref = mod.messageRef(FLOOR('“陆哥，你来了。”白鹭低声说道。', 'October 5, 2025 3:04pm'));
+    assertEqual(ref.date, 'October 5, 2025 3:04pm');
+    assertIncludes(ref.fp, '陆哥');
+    assert(mod.refKey(ref).includes('|'), 'refKey 要能拼成字符串');
+});
+check('同一分钟的两条不同消息不会撞成同一个身份', () => {
+    const a = mod.messageRef(FLOOR('第一条内容，很长很长很长。', 'same-minute'));
+    const b = mod.messageRef(FLOOR('第二条内容，完全不一样。', 'same-minute'));
+    assert(mod.refKey(a) !== mod.refKey(b), '正文不同就该区分开');
+});
+check('差集能找出被删掉的楼层', () => {
+    const before = mod.snapshotMessageRefs([FLOOR('一', 't1'), FLOOR('二', 't2'), FLOOR('三', 't3')]);
+    const after = mod.snapshotMessageRefs([FLOOR('一', 't1'), FLOOR('三', 't3')]);
+    const gone = mod.missingRefs(before, after);
+    assertEqual(gone.length, 1);
+    assertIncludes(gone[0].fp, '二');
+});
+check('删的是中间一楼，索引位移也不会误判', () => {
+    const before = mod.snapshotMessageRefs([FLOOR('甲', 't1'), FLOOR('乙', 't2'), FLOOR('丙', 't3'), FLOOR('丁', 't4')]);
+    const after = mod.snapshotMessageRefs([FLOOR('甲', 't1'), FLOOR('丙', 't3'), FLOOR('丁', 't4')]);
+    assertEqual(mod.missingRefs(before, after).length, 1, '只该认为少了一条');
+});
+check('一条都没删时就什么都不报', () => {
+    const refs = mod.snapshotMessageRefs([FLOOR('甲', 't1')]);
+    assertEqual(mod.missingRefs(refs, refs).length, 0);
+});
+check('角色回复计数只数非用户非系统', () => {
+    assertEqual(mod.assistantMessageCount([
+        { is_user: true, mes: 'a' },
+        { is_user: false, mes: 'b' },
+        { is_user: false, is_system: true, mes: 'c' },
+        { is_user: false, mes: 'd' },
+    ]), 2);
+});
+
+console.log('\n自动维护：计划与写入');
+
+const REF_A = { date: 't1', fp: '“陆哥，你来了。”' };
+const REF_B = { date: 't2', fp: '“小星星，来啦。”' };
+const candBailuToUser = { from: BAILU, to: USER_KEY, call: '陆哥', count: 3, confidence: 0.9 };
+const candUserToBailu = { from: USER_KEY, to: BAILU, call: '白鹭姐', count: 2, confidence: 0.7 };
+
+check('候选会创建原本不存在的称呼，并记下写入前的旧值', () => {
+    const plan = mod.planAutoUpdate({ candidates: [candBailuToUser], chatState: mod.emptyChatState(), journal: [], opts: {} });
+    assertEqual(plan.apply.length, 1);
+    assertEqual(plan.apply[0].before, null, '原本没有，before 必须是 null');
+    assertEqual(plan.apply[0].after.call, '陆哥');
+});
+check('写入后能得到新状态和一条带楼层身份的记录', () => {
+    const plan = mod.planAutoUpdate({ candidates: [candBailuToUser], chatState: mod.emptyChatState(), journal: [], opts: {} });
+    const { chatState, entries } = mod.applyAutoUpdate(mod.emptyChatState(), plan, { ...REF_A, assistantCount: 3 });
+    assertEqual(mod.getRelation(chatState, BAILU, USER_KEY).call, '陆哥');
+    assertEqual(entries.length, 1);
+    assertEqual(entries[0].ref.fp, REF_A.fp);
+    assertEqual(chatState.auto.lastRunAssistantCount, 3);
+    assertEqual(chatState.auto.journal.length, 1);
+});
+check('用户手工改过的关系，自动维护不碰', () => {
+    let state = mod.setRelation(mod.emptyChatState(), BAILU, USER_KEY, { call: '我就要叫他这个' });
+    const plan = mod.planAutoUpdate({ candidates: [candBailuToUser], chatState: state, journal: [], opts: {} });
+    assertEqual(plan.apply.length, 0);
+    assertIncludes(plan.skipped[0].reason, '手工改过');
+});
+check('仍归自动管的关系：只往别名里补，不动主称呼', () => {
+    const first = mod.planAutoUpdate({ candidates: [candBailuToUser], chatState: mod.emptyChatState(), journal: [], opts: {} });
+    const applied = mod.applyAutoUpdate(mod.emptyChatState(), first, REF_A);
+    const second = mod.planAutoUpdate({
+        candidates: [{ from: BAILU, to: USER_KEY, call: '小陆哥', count: 2, confidence: 0.8 }],
+        chatState: applied.chatState,
+        journal: applied.chatState.auto.journal,
+        opts: {},
+    });
+    assertEqual(second.apply.length, 1);
+    assertEqual(second.apply[0].after.call, '陆哥', '主称呼不该被改掉');
+    assertEqual(second.apply[0].after.aliases, ['小陆哥'], '新称呼应补进别名');
+});
+check('门槛：置信度和次数不够的跳过', () => {
+    const plan = mod.planAutoUpdate({
+        candidates: [
+            { from: BAILU, to: XINGYE, call: '低置信', count: 9, confidence: 0.3 },
+            { from: XINGYE, to: BAILU, call: '次数少', count: 1, confidence: 0.99 },
+        ],
+        chatState: mod.emptyChatState(),
+        journal: [],
+        opts: { minConfidence: 0.6, minCount: 2 },
+    });
+    assertEqual(plan.apply.length, 0);
+    assertEqual(plan.skipped.length, 2);
+    assertIncludes(plan.skipped[0].reason, '置信度');
+    assertIncludes(plan.skipped[1].reason, '出现次数');
+});
+check('一次最多改几条会被遵守', () => {
+    const many = [];
+    for (let i = 0; i < 10; i += 1) many.push({ from: `char:c${i}`, to: `char:c${i + 1}`, call: `称呼${i}`, count: 2, confidence: 0.9 });
+    const plan = mod.planAutoUpdate({ candidates: many, chatState: mod.emptyChatState(), journal: [], opts: { maxPerRun: 3 } });
+    assertEqual(plan.apply.length, 3);
+});
+check('同一对关系一次只处理一条', () => {
+    const plan = mod.planAutoUpdate({
+        candidates: [
+            { from: BAILU, to: USER_KEY, call: '陆哥', count: 3, confidence: 0.9 },
+            { from: BAILU, to: USER_KEY, call: '阿陆', count: 2, confidence: 0.8 },
+        ],
+        chatState: mod.emptyChatState(),
+        journal: [],
+        opts: {},
+    });
+    assertEqual(plan.apply.length, 1);
+});
+
+console.log('\n自动维护：删楼级联回滚');
+
+check('删掉依据的楼层 → 自动创建的称呼被删除', () => {
+    const plan = mod.planAutoUpdate({ candidates: [candBailuToUser], chatState: mod.emptyChatState(), journal: [], opts: {} });
+    const { chatState } = mod.applyAutoUpdate(mod.emptyChatState(), plan, REF_A);
+    const { chatState: after, reverted } = mod.revertByRefs(chatState, [REF_A]);
+    assertEqual(reverted.length, 1);
+    assertEqual(mod.getRelation(after, BAILU, USER_KEY), null, '原本没有的，回滚后应该没有');
+    assertEqual(after.auto.journal.length, 0, '记录也该清掉');
+});
+check('删掉依据的楼层 → 被改过的称呼退回改之前的值', () => {
+    // E1 建 call=小陆哥，E2 把「陆哥」补进别名；删 E2 的楼退回 E1 状态，删 E1 的楼整条消失
+    const owned = mod.planAutoUpdate({ candidates: [{ from: BAILU, to: USER_KEY, call: '小陆哥', count: 2, confidence: 0.9 }], chatState: mod.emptyChatState(), journal: [], opts: {} });
+    const created = mod.applyAutoUpdate(mod.emptyChatState(), owned, REF_A);
+    const second = mod.planAutoUpdate({
+        candidates: [{ from: BAILU, to: USER_KEY, call: '陆哥', count: 2, confidence: 0.9 }],
+        chatState: created.chatState,
+        journal: created.chatState.auto.journal,
+        opts: {},
+    });
+    const applied = mod.applyAutoUpdate(created.chatState, second, REF_B);
+    assertEqual(applied.chatState.auto.journal.length, 2, '应该有两条记录');
+    assertEqual(mod.getRelation(applied.chatState, BAILU, USER_KEY).call, '小陆哥');
+    assertEqual(mod.getRelation(applied.chatState, BAILU, USER_KEY).aliases, ['陆哥']);
+
+    // 只删后一条楼层：退回只有主称呼的状态
+    const step1 = mod.revertByRefs(applied.chatState, [REF_B]);
+    assertEqual(step1.reverted.length, 1);
+    assertEqual(mod.getRelation(step1.chatState, BAILU, USER_KEY).aliases, [], '别名该退掉');
+    assertEqual(step1.chatState.auto.journal.length, 1, '只剩第一条记录');
+
+    // 再删前一条：整条关系消失
+    const step2 = mod.revertByRefs(step1.chatState, [REF_A]);
+    assertEqual(step2.reverted.length, 1);
+    assertEqual(mod.getRelation(step2.chatState, BAILU, USER_KEY), null);
+});
+check('多条记录按时间倒序回滚，顺序错了会退错', () => {
+    // 同一 key 两次改动：E1 建 call=A，E2 把 call 改成 B
+    let state = mod.emptyChatState();
+    const p1 = mod.planAutoUpdate({ candidates: [{ from: BAILU, to: USER_KEY, call: '甲', count: 1, confidence: 0.9 }], chatState: state, journal: [], opts: {} });
+    const s1 = mod.applyAutoUpdate(state, p1, { date: 'x1', fp: 'floor1' });
+    state = s1.chatState;
+    // 手工把主称呼改成「乙」，让它归人管 —— 应该被保护，不回滚
+    state = mod.setRelation(state, BAILU, USER_KEY, { call: '乙' });
+    const { chatState: after, reverted, skipped } = mod.revertByRefs(state, [{ date: 'x1', fp: 'floor1' }]);
+    assertEqual(reverted.length, 0, '用户改过的不能回滚');
+    assertEqual(skipped.length, 1);
+    assertEqual(mod.getRelation(after, BAILU, USER_KEY).call, '乙', '手工改的值必须保住');
+    assertEqual(after.auto.journal.length, 0, '无效记录要清掉，免得下次再来一遍');
+});
+check('删别的楼层不会误伤', () => {
+    const plan = mod.planAutoUpdate({ candidates: [candBailuToUser], chatState: mod.emptyChatState(), journal: [], opts: {} });
+    const { chatState } = mod.applyAutoUpdate(mod.emptyChatState(), plan, REF_A);
+    const { chatState: after, reverted } = mod.revertByRefs(chatState, [{ date: 'other', fp: '无关楼层' }]);
+    assertEqual(reverted.length, 0);
+    assertEqual(mod.getRelation(after, BAILU, USER_KEY).call, '陆哥', '不该被删');
+});
+check('手动撤销单条：后面还有同一对关系的记录时会拒绝', () => {
+    const p1 = mod.planAutoUpdate({ candidates: [{ from: BAILU, to: USER_KEY, call: '甲', count: 1, confidence: 0.9 }], chatState: mod.emptyChatState(), journal: [], opts: {} });
+    const s1 = mod.applyAutoUpdate(mod.emptyChatState(), p1, REF_A);
+    const p2 = mod.planAutoUpdate({ candidates: [{ from: BAILU, to: USER_KEY, call: '乙', count: 1, confidence: 0.9 }], chatState: s1.chatState, journal: s1.chatState.auto.journal, opts: {} });
+    const s2 = mod.applyAutoUpdate(s1.chatState, p2, REF_B);
+    const first = s2.chatState.auto.journal[0];
+    const result = mod.revertOneEntry(s2.chatState, first.id);
+    assertEqual(result.reverted, null);
+    assertIncludes(result.reason, '之后');
+});
+check('手动撤销单条：最后一条且没被手工改过就能退', () => {
+    const p1 = mod.planAutoUpdate({ candidates: [{ from: BAILU, to: USER_KEY, call: '甲', count: 1, confidence: 0.9 }], chatState: mod.emptyChatState(), journal: [], opts: {} });
+    const s1 = mod.applyAutoUpdate(mod.emptyChatState(), p1, REF_A);
+    const id = s1.chatState.auto.journal[0].id;
+    const result = mod.revertOneEntry(s1.chatState, id);
+    assertEqual(result.reverted.id, id);
+    assertEqual(mod.getRelation(result.chatState, BAILU, USER_KEY), null);
+});
+check('清理依据已不存在的记录（开关期间删过楼）', () => {
+    const p1 = mod.planAutoUpdate({ candidates: [candBailuToUser], chatState: mod.emptyChatState(), journal: [], opts: {} });
+    const { chatState } = mod.applyAutoUpdate(mod.emptyChatState(), p1, REF_A);
+    const { chatState: pruned, dropped } = mod.pruneJournalByRefs(chatState, [REF_B]);
+    assertEqual(dropped, 1, '依据的楼层没了，记录该丢');
+    assertEqual(pruned.auto.journal.length, 0);
+    assertEqual(mod.getRelation(pruned, BAILU, USER_KEY).call, '陆哥', '关系本身不该被删');
+});
+check('编辑/滑动后把记录重绑到新身份上（楼没被删）', () => {
+    const p1 = mod.planAutoUpdate({ candidates: [candBailuToUser], chatState: mod.emptyChatState(), journal: [], opts: {} });
+    const { chatState } = mod.applyAutoUpdate(mod.emptyChatState(), p1, REF_A);
+    const moved = { date: 't1b', fp: '改过之后的正文' };
+    const { chatState: retargeted, changed } = mod.retargetJournalRefs(chatState, REF_A, moved);
+    assertEqual(changed, 1);
+    assertEqual(retargeted.auto.journal[0].ref.fp, moved.fp);
+    // 重绑之后，用旧身份去回滚就不该命中了
+    assertEqual(mod.revertByRefs(retargeted, [REF_A]).reverted.length, 0);
+    assertEqual(mod.revertByRefs(retargeted, [moved]).reverted.length, 1);
+});
+
+console.log('\n自动维护：设置与归一化');
+
+check('总开关默认关闭（装完不做事）', () => {
+    assertEqual(mod.defaultSettings().enabled, false);
+    assertEqual(mod.normalizeSettings({}).enabled, false);
+    assertEqual(mod.normalizeSettings({ enabled: 1 }).enabled, true);
+});
+check('自动维护默认也是关的，参数会被夹住', () => {
+    const s = mod.normalizeSettings({});
+    assertEqual(s.auto.enabled, false);
+    const clamped = mod.normalizeSettings({ auto: { everyN: 0, lookback: 9999, minConfidence: 5, maxPerRun: 0 } });
+    assertEqual(clamped.auto.everyN, 1);
+    assertEqual(clamped.auto.lookback, 500);
+    assertEqual(clamped.auto.minConfidence, 1);
+    assertEqual(clamped.auto.maxPerRun, 1);
+});
+check('老聊天数据没有 auto 字段也能读（向后兼容）', () => {
+    const state = mod.normalizeChatState({ relations: { [mod.relationKey(BAILU, USER_KEY)]: { call: '陆哥' } } });
+    assertEqual(state.auto.journal, []);
+    assertEqual(state.auto.lastRunAssistantCount, 0);
+    assertEqual(mod.getRelation(state, BAILU, USER_KEY).call, '陆哥');
+});
+check('脏 journal 条目会被丢掉，不会让归一化抛错', () => {
+    const state = mod.normalizeChatState({
+        auto: {
+            journal: [
+                { key: 'not-a-key', after: { call: 'x' } },
+                { key: mod.relationKey(BAILU, USER_KEY), after: null },
+                { key: mod.relationKey(BAILU, USER_KEY), after: { call: '陆哥' }, ref: { date: 't', fp: 'f' } },
+            ],
+            lastRunAssistantCount: -5,
+        },
+    });
+    assertEqual(state.auto.journal.length, 1);
+    assertEqual(state.auto.lastRunAssistantCount, 0);
+});
+check('journal 能随聊天一起导出导入（删楼回滚能力不丢）', () => {
+    const p1 = mod.planAutoUpdate({ candidates: [candBailuToUser], chatState: mod.emptyChatState(), journal: [], opts: {} });
+    const { chatState } = mod.applyAutoUpdate(mod.emptyChatState(), p1, REF_A);
+    const bundle = mod.exportBundle({ chatState, library: {}, settings: mod.defaultSettings() });
+    const back = mod.importBundle(JSON.stringify(bundle));
+    assertEqual(back.chat.auto.journal.length, 1);
+    assertEqual(back.chat.auto.journal[0].ref.fp, REF_A.fp);
+});
+
 /* ---------------- 汇总 ---------------- */
 
 console.log(`\n通过 ${passed} 项，失败 ${failures.length} 项`);

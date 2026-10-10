@@ -89,12 +89,13 @@ export function normalizeChatState(raw) {
         version: SCHEMA_VERSION,
         relations,
         novelMapping,
+        auto: normalizeAutoState(src.auto),
         updatedAt: Number(src.updatedAt) || 0,
     };
 }
 
 export function emptyChatState() {
-    return { version: SCHEMA_VERSION, relations: {}, novelMapping: {}, updatedAt: 0 };
+    return { version: SCHEMA_VERSION, relations: {}, novelMapping: {}, auto: emptyAutoState(), updatedAt: 0 };
 }
 
 /** 归一化「全局默认」关系库。 */
@@ -113,6 +114,8 @@ export function normalizeLibrary(raw) {
 export function defaultSettings() {
     return {
         version: SCHEMA_VERSION,
+        // 总开关默认关闭：装完什么都不做，不注入、不自动改、不自动回滚，等你手动打开
+        enabled: false,
         inject: {
             enabled: true,
             position: 1,      // 0=主提示内 1=对话内(按深度) 2=主提示前
@@ -140,6 +143,15 @@ export function defaultSettings() {
             injectNovel: false,  // 是否把当前小说的称呼表也注入提示词
         },
         novels: { version: SCHEMA_VERSION, items: {}, activeId: null },
+        // 自动维护：默认关闭，打开后每 N 条角色回复用本地扫描更新一次称呼
+        auto: {
+            enabled: false,
+            everyN: 5,           // 每多少条角色回复更新一次
+            lookback: 12,        // 用最近多少楼当依据
+            minConfidence: 0.6,  // 本地扫描的置信度门槛
+            minCount: 1,
+            maxPerRun: 6,        // 一次最多写几条，防止一次改一大片
+        },
         // 界面偏好：关系默认用放射图看（表格留着手工改）
         ui: { relationsView: 'graph', novelView: 'graph' },
         library: {},
@@ -155,6 +167,7 @@ export function normalizeSettings(raw) {
     const extract = { ...base.extract, ...(src.extract && typeof src.extract === 'object' ? src.extract : {}) };
     const custom = { ...base.extract.custom, ...(extract.custom && typeof extract.custom === 'object' ? extract.custom : {}) };
     const ui = { ...base.ui, ...(src.ui && typeof src.ui === 'object' ? src.ui : {}) };
+    const auto = { ...base.auto, ...(src.auto && typeof src.auto === 'object' ? src.auto : {}) };
 
     inject.depth = clampInt(inject.depth, 0, 10000, base.inject.depth);
     inject.position = [0, 1, 2].includes(Number(inject.position)) ? Number(inject.position) : base.inject.position;
@@ -189,12 +202,21 @@ export function normalizeSettings(raw) {
     ui.relationsView = ['graph', 'table'].includes(ui.relationsView) ? ui.relationsView : 'graph';
     ui.novelView = ['graph', 'table'].includes(ui.novelView) ? ui.novelView : 'graph';
 
+    auto.enabled = Boolean(auto.enabled);
+    auto.everyN = clampInt(auto.everyN, 1, 200, base.auto.everyN);
+    auto.lookback = clampInt(auto.lookback, 1, 500, base.auto.lookback);
+    auto.minConfidence = clampNumber(auto.minConfidence, 0, 1, base.auto.minConfidence);
+    auto.minCount = clampInt(auto.minCount, 1, 100, base.auto.minCount);
+    auto.maxPerRun = clampInt(auto.maxPerRun, 1, 100, base.auto.maxPerRun);
+
     return {
         ...base,
         ...src,
+        enabled: Boolean(src.enabled),
         inject,
         scan,
         extract,
+        auto,
         ui,
         novels: normalizeNovels(src.novels),
         library: normalizeLibrary(src.library),
@@ -1314,6 +1336,294 @@ export function applyExtractToChatState(chatState, results, mapping) {
         next = setRelation(next, rel.from, rel.to, { call: rel.call, aliases: rel.aliases });
     }
     return next;
+}
+
+/* ------------------------------------------------------------------ *
+ * 自动维护：按楼层更新称呼，删楼时级联回滚
+ *
+ * 酒馆给不了「这条回复是谁」的稳定 id：
+ *   - 消息对象里没有 uuid，send_date 精度只到分钟（同分钟两条就撞）；
+ *   - deleteMessage 是先 splice 再 emit，事件里给的是删除后的 chat.length，拿不到被删的索引。
+ * 所以这里用「send_date + 正文前 60 字」当身份，并且靠**前后两次快照做差集**判断哪楼没了。
+ *
+ * 每次自动更新的依据都记进 journal（含写入前的旧值），删楼时按时间倒序回滚。
+ * ------------------------------------------------------------------ */
+
+export function messageRef(message) {
+    const text = str(message?.mes)
+        .replace(/<[^>]*>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    return { date: str(message?.send_date), fp: text.slice(0, 60) };
+}
+
+export function refKey(ref) {
+    return `${str(ref?.date)}|${str(ref?.fp)}`;
+}
+
+/** 给当前聊天的每条消息编身份。index 只用于界面显示和滑动重定位。 */
+export function snapshotMessageRefs(messages) {
+    return (messages ?? []).map((message, index) => {
+        const ref = messageRef(message);
+        return { index, date: ref.date, fp: ref.fp };
+    });
+}
+
+/** 旧快照里有、新快照里没有的，就是被删掉的楼。 */
+export function missingRefs(before, after) {
+    const alive = new Set((after ?? []).map(refKey));
+    return (before ?? []).filter(ref => !alive.has(refKey(ref)));
+}
+
+/** 角色回复（非用户、非系统）的条数，用来算「隔几条回复更新一次」。 */
+export function assistantMessageCount(messages) {
+    return (messages ?? []).filter(message => message && !message.is_user && !message.is_system).length;
+}
+
+export function emptyAutoState() {
+    return { journal: [], lastRunAssistantCount: 0, lastRunAt: 0 };
+}
+
+export function normalizeJournal(raw) {
+    const out = [];
+    for (const entry of Array.isArray(raw) ? raw : []) {
+        if (!entry || typeof entry !== 'object') continue;
+        const key = str(entry.key).trim();
+        if (!key || !parseRelationKey(key)) continue;
+        const after = normalizeRelation(entry.after);
+        if (!after) continue;
+        out.push({
+            id: str(entry.id).trim() || `je_${out.length}_${Math.random().toString(36).slice(2, 8)}`,
+            at: Number(entry.at) || 0,
+            key,
+            from: str(entry.from),
+            to: str(entry.to),
+            call: str(entry.call),
+            before: normalizeRelation(entry.before),
+            after,
+            ref: { date: str(entry.ref?.date), fp: str(entry.ref?.fp) },
+        });
+    }
+    return out;
+}
+
+export function normalizeAutoState(raw) {
+    const src = raw && typeof raw === 'object' ? raw : {};
+    return {
+        journal: normalizeJournal(src.journal),
+        lastRunAssistantCount: clampInt(src.lastRunAssistantCount, 0, 1000000, 0),
+        lastRunAt: Number(src.lastRunAt) || 0,
+    };
+}
+
+/** 每条关系的「当前归属」：最后一条 journal 决定它现在应该是多少。 */
+export function foldJournal(journal) {
+    const map = new Map();
+    for (const entry of normalizeJournal(journal)) map.set(entry.key, entry);
+    return map;
+}
+
+/**
+ * 哪些关系仍然是「自动维护在管」的——即当前值和 journal 记的最终值完全一致。
+ * 只要用户手工改过，值就不一致，自动维护就不会再动它。
+ */
+export function autoOwnedKeys(journal, chatState) {
+    const state = normalizeChatState(chatState);
+    const owned = new Set();
+    for (const [key, entry] of foldJournal(journal)) {
+        const current = state.relations[key];
+        if (!current) continue;
+        if (JSON.stringify(current) === JSON.stringify(entry.after)) owned.add(key);
+    }
+    return owned;
+}
+
+/**
+ * 决定这一轮自动更新写什么。
+ * 保守策略：不存在的才创建；已存在且仍归自动管的，只往别名里补，绝不改主称呼（否则会来回抖）。
+ */
+export function planAutoUpdate({ candidates = [], chatState = null, journal = [], opts = {} } = {}) {
+    const state = normalizeChatState(chatState);
+    const owned = autoOwnedKeys(journal, state);
+    const minConfidence = clampNumber(opts.minConfidence, 0, 1, 0.6);
+    const minCount = clampInt(opts.minCount, 1, 100, 1);
+    const maxPerRun = clampInt(opts.maxPerRun, 1, 100, 6);
+
+    const apply = [];
+    const skipped = [];
+    const handled = new Set();
+
+    for (const cand of candidates ?? []) {
+        if (!cand?.from || !cand?.to || cand.from === cand.to) continue;
+        const key = relationKey(cand.from, cand.to);
+        if (handled.has(key)) continue;
+        if ((cand.confidence ?? 0) < minConfidence) {
+            skipped.push({ ...cand, reason: '置信度不够' });
+            continue;
+        }
+        if ((cand.count ?? 0) < minCount) {
+            skipped.push({ ...cand, reason: '出现次数不够' });
+            continue;
+        }
+        const current = state.relations[key] ?? null;
+        if (current && !owned.has(key)) {
+            skipped.push({ ...cand, reason: '这对关系你手工改过，自动维护不碰' });
+            continue;
+        }
+        if (current?.call === cand.call) {
+            skipped.push({ ...cand, reason: '已经是这个称呼了' });
+            continue;
+        }
+
+        let after;
+        if (!current) {
+            after = { call: cand.call, aliases: [], stage: '', note: '' };
+        } else if (!current.call) {
+            after = { ...current, call: cand.call };
+        } else {
+            after = {
+                ...current,
+                aliases: uniq([...(current.aliases ?? []), cand.call]).filter(a => a !== current.call),
+            };
+        }
+        const normalized = normalizeRelation(after);
+        if (!normalized || JSON.stringify(normalized) === JSON.stringify(current)) {
+            skipped.push({ ...cand, reason: '没有可写的变化' });
+            continue;
+        }
+
+        handled.add(key);
+        apply.push({
+            key,
+            from: cand.from,
+            to: cand.to,
+            call: cand.call,
+            before: current,
+            after: normalized,
+            confidence: cand.confidence ?? 0,
+            count: cand.count ?? 1,
+        });
+        if (apply.length >= maxPerRun) break;
+    }
+
+    return { apply, skipped };
+}
+
+/** 把计划写进关系表，并为每条改动记一条 journal。ref 是「这次更新的依据是哪一楼」。 */
+export function applyAutoUpdate(chatState, plan, ref, now = Date.now()) {
+    const state = normalizeChatState(chatState);
+    const entries = [];
+    for (const item of plan?.apply ?? []) {
+        state.relations[item.key] = item.after;
+        entries.push({
+            id: `je_${now.toString(36)}_${entries.length}_${Math.random().toString(36).slice(2, 6)}`,
+            at: now,
+            key: item.key,
+            from: item.from,
+            to: item.to,
+            call: item.call,
+            before: item.before,
+            after: item.after,
+            ref: { date: str(ref?.date), fp: str(ref?.fp) },
+        });
+    }
+    state.auto.journal = [...state.auto.journal, ...entries];
+    state.auto.lastRunAssistantCount = clampInt(ref?.assistantCount, 0, 1000000, state.auto.lastRunAssistantCount);
+    state.auto.lastRunAt = now;
+    state.updatedAt = now;
+    return { chatState: state, entries };
+}
+
+/** 只更新「上次跑到第几条回复」这类计数，不写关系。 */
+export function touchAutoProgress(chatState, { assistantCount, now = Date.now() } = {}) {
+    const state = normalizeChatState(chatState);
+    state.auto.lastRunAssistantCount = clampInt(assistantCount, 0, 1000000, state.auto.lastRunAssistantCount);
+    state.auto.lastRunAt = now;
+    return state;
+}
+
+/**
+ * 删楼级联回滚：把依据这些楼写进去的改动，按时间倒序退回去。
+ *
+ * 两条纪律：
+ *  1. 倒序——同一条关系可能被改过多次，每条 journal 的 before 是当时的真实值。
+ *  2. 回滚前再确认「当前值还等于它当初写下的值」。如果用户中途手工改过，
+ *     说明这条关系已经归人手管了，**不能回滚**（否则删一楼会顺手抹掉你手工写的称呼），
+ *     只把记录丢掉并如实报出来。
+ */
+export function revertByRefs(chatState, refs, now = Date.now()) {
+    const state = normalizeChatState(chatState);
+    const wanted = new Set((refs ?? []).map(refKey));
+    if (!wanted.size) return { chatState: state, reverted: [], skipped: [] };
+
+    const hits = [];
+    state.auto.journal.forEach((entry, index) => {
+        if (wanted.has(refKey(entry.ref))) hits.push({ entry, index });
+    });
+    if (!hits.length) return { chatState: state, reverted: [], skipped: [] };
+
+    const hitIds = new Set(hits.map(hit => hit.entry.id));
+    hits.sort((a, b) => b.index - a.index);
+
+    const reverted = [];
+    const skipped = [];
+    for (const { entry } of hits) {
+        const current = state.relations[entry.key] ?? null;
+        if (JSON.stringify(current) !== JSON.stringify(entry.after)) {
+            skipped.push(entry);
+            continue;
+        }
+        if (entry.before) state.relations[entry.key] = entry.before;
+        else delete state.relations[entry.key];
+        reverted.push(entry);
+    }
+    state.auto.journal = state.auto.journal.filter(entry => !hitIds.has(entry.id));
+    state.updatedAt = now;
+    return { chatState: state, reverted, skipped };
+}
+
+/** 单独撤销一条 journal（界面上点「撤销这条」）。 */
+export function revertOneEntry(chatState, id, now = Date.now()) {
+    const state = normalizeChatState(chatState);
+    const index = state.auto.journal.findIndex(entry => entry.id === id);
+    if (index < 0) return { chatState: state, reverted: null, reason: '找不到这条记录' };
+    const entry = state.auto.journal[index];
+    const later = state.auto.journal.slice(index + 1).some(other => other.key === entry.key);
+    if (later) {
+        return { chatState: state, reverted: null, reason: '这条之后这对关系还被改过，请用「撤销最近一次」或删楼来回滚' };
+    }
+    const current = state.relations[entry.key] ?? null;
+    if (JSON.stringify(current) !== JSON.stringify(entry.after)) {
+        return { chatState: state, reverted: null, reason: '这条关系你已经手工改过，不覆盖你的改动' };
+    }
+    if (entry.before) state.relations[entry.key] = entry.before;
+    else delete state.relations[entry.key];
+    state.auto.journal = state.auto.journal.filter(other => other.id !== id);
+    state.updatedAt = now;
+    return { chatState: state, reverted: entry };
+}
+
+/** 清掉依据已不存在的楼写的记录（开关过插件、或换过聊天之后会发生）。 */
+export function pruneJournalByRefs(chatState, refs) {
+    const state = normalizeChatState(chatState);
+    const alive = new Set((refs ?? []).map(refKey));
+    const kept = state.auto.journal.filter(entry => alive.has(refKey(entry.ref)));
+    const dropped = state.auto.journal.length - kept.length;
+    state.auto.journal = kept;
+    return { chatState: state, dropped };
+}
+
+/** 滑动/改写之后，把指向那条消息的记录重新绑到它的新身份上。 */
+export function retargetJournalRefs(chatState, fromRef, toRef) {
+    if (!fromRef || !toRef || refKey(fromRef) === refKey(toRef)) return { chatState: normalizeChatState(chatState), changed: 0 };
+    const state = normalizeChatState(chatState);
+    let changed = 0;
+    for (const entry of state.auto.journal) {
+        if (refKey(entry.ref) !== refKey(fromRef)) continue;
+        entry.ref = { date: str(toRef.date), fp: str(toRef.fp) };
+        changed += 1;
+    }
+    return { chatState: state, changed };
 }
 
 /* ------------------------------------------------------------------ *

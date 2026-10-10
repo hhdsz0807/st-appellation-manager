@@ -11,6 +11,8 @@ import {
     EXT_ID,
     USER_KEY,
     applyExtractToChatState,
+    applyAutoUpdate,
+    assistantMessageCount,
     autoMapNames,
     buildNovelTable,
     buildParticipants,
@@ -34,6 +36,8 @@ import {
     lintRelations,
     listNovels,
     mergeExtractResults,
+    messageRef,
+    missingRefs,
     newNovelId,
     normalizeChatState,
     normalizeNovel,
@@ -44,9 +48,17 @@ import {
     novelTableToText,
     parseRelationKey,
     patchesToRelations,
+    planAutoUpdate,
+    pruneJournalByRefs,
+    refKey,
     relationKey,
     resolveRelation,
+    retargetJournalRefs,
+    revertByRefs,
+    revertOneEntry,
     scanCandidates,
+    snapshotMessageRefs,
+    touchAutoProgress,
     setRelation as setRelationPure,
 } from './core.js';
 import { createCaller, createSingleFlight, fetchModelList, joinModelsUrl, pickDefaultModel, runExtraction, supportsChatCompletions } from './extract.js';
@@ -153,6 +165,26 @@ function messagesOf() {
 }
 
 /* ------------------------------------------------------------------ *
+ * 楼层身份快照
+ *
+ * 酒馆的消息没有 uuid，send_date 只精确到分钟；
+ * 而 deleteMessage 是先 splice 再发事件、事件参数还是删除后的 chat.length，
+ * 从事件本身根本推不出删了哪一楼。所以维护一份「每条楼的身份」快照，
+ * 用前后差集判断谁没了。
+ * ------------------------------------------------------------------ */
+
+let messageRefs = [];
+
+function refreshMessageRefs() {
+    messageRefs = snapshotMessageRefs(messagesOf());
+    return messageRefs;
+}
+
+function participantNameOf(key) {
+    return participantsOf().find(p => p.key === key)?.name ?? key;
+}
+
+/* ------------------------------------------------------------------ *
  * 小说库
  *
  * 「先建立小说的称呼」——结果存在全局设置里，跟当前开着哪个聊天无关。
@@ -250,7 +282,8 @@ function refreshInjection() {
     const participants = participantsOf();
 
     let text = '';
-    if (inject.enabled && participants.length > 1) {
+    // 总开关关着就什么都不注入（但仍然把已有的注入清掉，免得关掉之后还残留）
+    if (settings.enabled && inject.enabled && participants.length > 1) {
         text = composePromptBlock({
             participants,
             chatState: readChatState(),
@@ -261,7 +294,7 @@ function refreshInjection() {
     }
 
     // 可选：把当前这部小说的原著称呼表也带上（人名级，不依赖聊天里有谁）。
-    if (inject.enabled && settings.extract.injectNovel && text.length < inject.maxChars) {
+    if (settings.enabled && inject.enabled && settings.extract.injectNovel && text.length < inject.maxChars) {
         const novel = activeNovel();
         const novelBlock = novel ? composeNovelPromptBlock(novel, { maxChars: inject.maxChars - text.length }) : '';
         if (novelBlock) text = text ? `${text}\n\n${novelBlock}` : novelBlock;
@@ -274,6 +307,149 @@ function refreshInjection() {
         console.error(LOG_PREFIX, '注入提示词失败', error);
     }
 }
+
+/* ------------------------------------------------------------------ *
+ * 自动维护：按楼层更新 + 删楼级联回滚
+ * ------------------------------------------------------------------ */
+
+/** 到点了就跑一轮本地扫描（免费，不调模型）。没到点直接返回。 */
+function maybeRunAutoUpdate() {
+    const settings = getSettings();
+    if (!settings.enabled || !settings.auto.enabled) return null;
+    const state = readChatState();
+    const count = assistantMessageCount(messagesOf());
+    if (count - state.auto.lastRunAssistantCount < settings.auto.everyN) return null;
+    return runAutoUpdate();
+}
+
+/**
+ * 跑一轮自动更新：拿最近若干楼做本地扫描，只写「还不存在的」和「仍归自动管的」关系。
+ * 依据的那一楼身份记进 journal，删楼时好回滚。
+ */
+function runAutoUpdate() {
+    const settings = getSettings();
+    const participants = participantsOf();
+    const messages = messagesOf();
+    const state = readChatState();
+
+    const candidates = scanCandidates({
+        messages,
+        participants,
+        limit: settings.auto.lookback,
+        minCount: 1,
+    });
+    const plan = planAutoUpdate({
+        candidates,
+        chatState: state,
+        journal: state.auto.journal,
+        opts: settings.auto,
+    });
+
+    const assistantCount = assistantMessageCount(messages);
+    const lastAssistant = [...messages].reverse().find(m => m && !m.is_user && !m.is_system);
+    const ref = { ...messageRef(lastAssistant), assistantCount };
+
+    if (!plan.apply.length) {
+        writeChatState(touchAutoProgress(state, { assistantCount }));
+        return { applied: 0, skipped: plan.skipped.length, candidates: candidates.length };
+    }
+
+    const { chatState: next, entries } = applyAutoUpdate(state, plan, ref);
+    writeChatState(next);
+    refreshInjection();
+    return { applied: entries.length, skipped: plan.skipped.length, candidates: candidates.length, entries };
+}
+
+/** 聊天换了：重建快照，并把依据已不存在的记录清掉（开关期间删过的楼会留下这种悬空记录）。 */
+function onChatChanged() {
+    refreshMessageRefs();
+    const state = readChatState();
+    const { chatState: pruned, dropped } = pruneJournalByRefs(state, messageRefs);
+    if (dropped) {
+        writeChatState(pruned);
+        console.log(LOG_PREFIX, `清理了 ${dropped} 条依据楼层已不存在的自动更新记录`);
+    }
+    refreshInjection();
+    panel?.render();
+}
+
+/** 收到新楼：先重建快照，再看要不要跑自动更新。 */
+function onMessageReceived() {
+    refreshMessageRefs();
+    const result = maybeRunAutoUpdate();
+    if (result?.applied) {
+        panel?.setStatus(`自动维护：更新了 ${result.applied} 条称呼${result.skipped ? `（跳过 ${result.skipped} 条）` : ''}`);
+        panel?.render();
+    } else {
+        panel?.renderLight();
+    }
+}
+
+/** 编辑 / 滑动：楼还在，只是内容变了 —— 把指向它的记录重新绑到新身份，不要当成删除。 */
+function onMessageContentChanged() {
+    const before = messageRefs;
+    refreshMessageRefs();
+    const state = readChatState();
+    let next = state;
+    let changed = 0;
+    messageRefs.forEach((ref, index) => {
+        const old = before[index];
+        if (!old || refKey(old) === refKey(ref)) return;
+        const result = retargetJournalRefs(next, old, ref);
+        if (result.changed) {
+            next = result.chatState;
+            changed += result.changed;
+        }
+    });
+    if (changed) {
+        writeChatState(next);
+        console.log(LOG_PREFIX, `重绑了 ${changed} 条记录到改动后的楼层`);
+    }
+    panel?.renderLight();
+}
+
+/** 删楼：差集找出消失的楼，把依据它们写进去的称呼按时间倒序退回去。 */
+function onMessageDeleted() {
+    const before = messageRefs;
+    refreshMessageRefs();
+    const gone = missingRefs(before, messageRefs);
+
+    const state = readChatState();
+    // 删楼后角色回复总数变少了，进度计数要收口，否则要再等好几条回复才会触发下一次
+    const currentCount = assistantMessageCount(messagesOf());
+    let working = state;
+    if (currentCount < state.auto.lastRunAssistantCount) {
+        working = touchAutoProgress(state, { assistantCount: currentCount, now: state.auto.lastRunAt });
+    }
+
+    if (!gone.length) {
+        if (working !== state) writeChatState(working);
+        panel?.renderLight();
+        return;
+    }
+
+    const { chatState: next, reverted, skipped } = revertByRefs(working, gone);
+    if (!reverted.length && !skipped.length) {
+        if (working !== state) writeChatState(working);
+        panel?.renderLight();
+        return;
+    }
+
+    writeChatState(next);
+    refreshInjection();
+    const detail = reverted.map(entry => {
+        const pair = `${participantNameOf(entry.from)} → ${participantNameOf(entry.to)}`;
+        return entry.before ? `${pair} 退回「${entry.before.call || '空'}」` : `${pair} 删除「${entry.call}」`;
+    });
+    const held = skipped.map(entry => `${participantNameOf(entry.from)} → ${participantNameOf(entry.to)}（你手工改过，没动）`);
+    console.log(LOG_PREFIX, '删楼级联回滚：', detail, held);
+    const parts = [];
+    if (reverted.length) parts.push(`回滚了 ${reverted.length} 条：${detail.join('；')}`);
+    if (skipped.length) parts.push(`跳过 ${skipped.length} 条（你手工改过）：${held.join('；')}`);
+    panel?.setStatus(`删楼连带处理：${parts.join('　|　')}`);
+    panel?.render();
+}
+
 
 /* ------------------------------------------------------------------ *
  * 面板读写接口
@@ -600,6 +776,66 @@ const api = {
         const settings = getSettings();
         settings.ui = { ...settings.ui, [key]: value };
         saveSettings();
+    },
+
+    /* ---------------- 总开关与自动维护 ---------------- */
+
+    setEnabled(value) {
+        const settings = getSettings();
+        settings.enabled = Boolean(value);
+        saveSettings();
+        refreshInjection();
+        panel?.render();
+    },
+    getAutoUiState() {
+        const settings = getSettings();
+        const state = readChatState();
+        const messages = messagesOf();
+        const count = assistantMessageCount(messages);
+        const participants = participantsOf();
+        const nameOf = key => participants.find(p => p.key === key)?.name ?? key;
+        return {
+            enabled: Boolean(settings.enabled),
+            auto: settings.auto,
+            journalTotal: state.auto.journal.length,
+            journal: [...state.auto.journal].reverse().slice(0, 20).map(entry => ({
+                id: entry.id,
+                label: `${nameOf(entry.from)} → ${nameOf(entry.to)}`,
+                call: entry.call,
+                before: entry.before ? (entry.before.call || entry.before.aliases.join('、')) : '（原本没有）',
+                floor: entry.ref?.fp ? entry.ref.fp.slice(0, 16) : '（认不出楼层）',
+                at: entry.at,
+            })),
+            assistantCount: count,
+            sinceLastRun: Math.max(0, count - state.auto.lastRunAssistantCount),
+            lastRunAt: state.auto.lastRunAt,
+            messageRefs: messageRefs.length,
+        };
+    },
+    setAutoOption(key, value) {
+        const settings = getSettings();
+        settings.auto = { ...settings.auto, [key]: value };
+        saveSettings();
+        panel?.render();
+    },
+    runAutoUpdateNow() {
+        return runAutoUpdate();
+    },
+    revertAutoEntry(id) {
+        const { chatState: next, reverted, reason } = revertOneEntry(readChatState(), id);
+        if (!reverted) return { ok: false, reason: reason ?? '找不到这条记录' };
+        writeChatState(next);
+        refreshInjection();
+        panel?.render();
+        return { ok: true, reverted };
+    },
+    clearJournal() {
+        const state = readChatState();
+        const count = state.auto.journal.length;
+        state.auto.journal = [];
+        writeChatState(state);
+        panel?.render();
+        return count;
     },
     abortExtract() {
         if (!extractRuntime.running) return;
@@ -1153,24 +1389,30 @@ function bindEvents() {
         refreshInjection();
         panel?.renderLight();
     };
+    const on = (name, handler) => {
+        const type = types[name];
+        if (!type) return;
+        events.on(type, handler);
+        boundListeners.push({ eventBus: events, type, handler });
+    };
+
     // 聊天换了、群成员变了：整块重建
-    for (const name of ['CHAT_CHANGED', 'GROUP_UPDATED', 'CHARACTER_EDITED']) {
-        const type = types[name];
-        if (!type) continue;
-        events.on(type, refreshAll);
-        boundListeners.push({ eventBus: events, type, handler: refreshAll });
-    }
+    on('CHAT_CHANGED', onChatChanged);
+    on('GROUP_UPDATED', refreshAll);
+    on('CHARACTER_EDITED', refreshAll);
     // 收发消息、生成前：只轻量刷新，别打断正在编辑关系的人
-    for (const name of ['MESSAGE_RECEIVED', 'MESSAGE_SENT', 'GENERATION_AFTER_COMMANDS']) {
-        const type = types[name];
-        if (!type) continue;
-        events.on(type, refreshLight);
-        boundListeners.push({ eventBus: events, type, handler: refreshLight });
-    }
-    if (types.APP_READY) {
-        events.on(types.APP_READY, startPanelMounting);
-        boundListeners.push({ eventBus: events, type: types.APP_READY, handler: startPanelMounting });
-    }
+    on('MESSAGE_RECEIVED', onMessageReceived);
+    on('MESSAGE_SENT', () => { refreshMessageRefs(); refreshLight(); });
+    on('GENERATION_AFTER_COMMANDS', refreshLight);
+    // 编辑 / 滑动：楼还在，只换了内容
+    on('MESSAGE_EDITED', onMessageContentChanged);
+    on('MESSAGE_UPDATED', onMessageContentChanged);
+    on('MESSAGE_SWIPED', onMessageContentChanged);
+    on('MESSAGE_SWIPE_DELETED', onMessageContentChanged);
+    // 删楼：级联回滚
+    on('MESSAGE_DELETED', onMessageDeleted);
+    if (types.APP_READY) on('APP_READY', startPanelMounting);
+
     listenersBound = true;
 }
 

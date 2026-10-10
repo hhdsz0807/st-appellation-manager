@@ -509,3 +509,62 @@
 #stam-panel .stam-graph-legend {
     margin-top: 4px;
 }
+
+/* ---------- 总开关 ---------- */
+
+#stam-panel .stam-master {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 7px 9px;
+    border-radius: 6px;
+    border: 1px solid var(--SmartThemeQuoteColor, #c9a227);
+    background: color-mix(in srgb, var(--SmartThemeQuoteColor, #c9a227) 10%, transparent);
+}
+
+#stam-panel .stam-master-off {
+    border-color: var(--SmartThemeBorderColor, #666);
+    border-style: dashed;
+    background: transparent;
+}
+
+#stam-panel .stam-master-title {
+    font-weight: 600;
+}
+
+#stam-panel .stam-master-state {
+    font-size: 0.86em;
+    opacity: 0.9;
+}
+
+/* ---------- 自动维护 ---------- */
+
+#stam-panel .stam-auto-body {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+#stam-panel .stam-journal {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    max-height: 240px;
+    overflow-y: auto;
+}
+
+#stam-panel .stam-journal-row {
+    display: grid;
+    grid-template-columns: 1fr auto auto;
+    gap: 4px 8px;
+    align-items: center;
+    padding: 3px 4px;
+    border: 1px solid var(--SmartThemeBorderColor, #555);
+    border-radius: 4px;
+}
+
+#stam-panel .stam-journal-main {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}

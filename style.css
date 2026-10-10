@@ -23,11 +23,30 @@
     color: var(--SmartThemeQuoteColor, #c9a227);
 }
 
+#stam-panel .stam-summary {
+    flex: 1;
+    margin-left: 8px;
+    font-size: 0.82em;
+    opacity: 0.75;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+#stam-panel .stam-summary-off {
+    opacity: 0.55;
+}
+
+#stam-panel.stam-collapsed {
+    padding: 6px 8px;
+}
+
 #stam-panel .stam-collapse {
     width: 24px;
     height: 24px;
     line-height: 1;
     cursor: pointer;
+    flex-shrink: 0;
 }
 
 #stam-panel .stam-content {

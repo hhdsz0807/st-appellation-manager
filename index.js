@@ -777,6 +777,21 @@ const api = {
         settings.ui = { ...settings.ui, [key]: value };
         saveSettings();
     },
+    /** 收起状态下标题栏要显示的那一行摘要。 */
+    getSummary() {
+        const settings = getSettings();
+        const state = readChatState();
+        const participants = participantsOf();
+        const relations = Object.keys(state.relations).length;
+        const journal = state.auto.journal.length;
+        return {
+            enabled: Boolean(settings.enabled),
+            autoEnabled: Boolean(settings.auto.enabled),
+            relations,
+            journal,
+            characters: Math.max(0, participants.length - 1),
+        };
+    },
 
     /* ---------------- 总开关与自动维护 ---------------- */
 

@@ -152,8 +152,8 @@ export function defaultSettings() {
             minCount: 1,
             maxPerRun: 6,        // 一次最多写几条，防止一次改一大片
         },
-        // 界面偏好：关系默认用放射图看（表格留着手工改）
-        ui: { relationsView: 'graph', novelView: 'graph' },
+        // 界面偏好：关系默认用放射图看（表格留着手工改）；面板默认收起，别一开扩展抽屉就占满屏
+        ui: { relationsView: 'graph', novelView: 'graph', collapsed: true },
         library: {},
     };
 }
@@ -201,6 +201,8 @@ export function normalizeSettings(raw) {
 
     ui.relationsView = ['graph', 'table'].includes(ui.relationsView) ? ui.relationsView : 'graph';
     ui.novelView = ['graph', 'table'].includes(ui.novelView) ? ui.novelView : 'graph';
+    // 没设置过就默认收起
+    ui.collapsed = ui.collapsed === undefined ? true : Boolean(ui.collapsed);
 
     auto.enabled = Boolean(auto.enabled);
     auto.everyN = clampInt(auto.everyN, 1, 200, base.auto.everyN);

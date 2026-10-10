@@ -1073,6 +1073,12 @@ check('编辑/滑动后把记录重绑到新身份上（楼没被删）', () => 
 
 console.log('\n自动维护：设置与归一化');
 
+check('面板默认收起（一开扩展抽屉别占满屏）', () => {
+    assertEqual(mod.defaultSettings().ui.collapsed, true);
+    assertEqual(mod.normalizeSettings({}).ui.collapsed, true);
+    assertEqual(mod.normalizeSettings({ ui: {} }).ui.collapsed, true, '老设置里没有这个字段时也要默认收起');
+    assertEqual(mod.normalizeSettings({ ui: { collapsed: false } }).ui.collapsed, false, '用户展开过就记住');
+});
 check('总开关默认关闭（装完不做事）', () => {
     assertEqual(mod.defaultSettings().enabled, false);
     assertEqual(mod.normalizeSettings({}).enabled, false);

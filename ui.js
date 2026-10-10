@@ -440,7 +440,7 @@ function createExtractSection(api, setStatus) {
         el('legend', { text: '小说称呼库' }),
         el('div', { class: 'stam-hint', text: '先在这里把小说的称呼建立起来——跟当前开着哪个聊天无关，建好了以后哪个聊天都能拿来用。' }),
         novelToolbar,
-        el('details', { class: 'stam-extract', open: 'open' }, [
+        el('details', { class: 'stam-extract' }, [
             el('summary', { text: '导入正文并提取' }),
             el('div', { class: 'stam-extract-body' }, [
                 textarea,
@@ -953,7 +953,8 @@ function createAutoSection(api, setStatus) {
 
 export function createPanel(api) {
     const state = {
-        collapsed: false,
+        // 默认收起：一开扩展抽屉就被这块占满屏，体验很差
+        collapsed: api.getSettings().ui.collapsed ?? true,
         filter: 'all',       // all | user | focus
         candidates: [],
         issues: [],
@@ -1114,16 +1115,41 @@ export function createPanel(api) {
         statusLine,
     ]);
 
-    const toggleBtn = el('button', { class: 'stam-collapse', type: 'button', text: '−' });
+    const toggleBtn = el('button', { class: 'stam-collapse', type: 'button' });
+    const summarySpan = el('span', { class: 'stam-summary', id: 'stam-summary' });
+
+    function updateSummary() {
+        const summary = api.getSummary();
+        const bits = [summary.enabled ? '已开启' : '已关闭'];
+        if (summary.enabled && summary.autoEnabled) bits.push('自动维护开');
+        if (summary.relations) bits.push(`${summary.relations} 条关系`);
+        if (summary.journal) bits.push(`${summary.journal} 条自动记录`);
+        if (!summary.relations && !summary.characters) bits.push('没有聊天');
+        summarySpan.textContent = bits.join(' · ');
+        summarySpan.classList.toggle('stam-summary-off', !summary.enabled);
+    }
+
+    function applyCollapsed() {
+        content.style.display = state.collapsed ? 'none' : '';
+        toggleBtn.textContent = state.collapsed ? '＋' : '－';
+        toggleBtn.title = state.collapsed ? '展开称呼管理器' : '收起';
+        toggleBtn.setAttribute('aria-expanded', state.collapsed ? 'false' : 'true');
+        root.classList.toggle('stam-collapsed', state.collapsed);
+        updateSummary();
+    }
+
     toggleBtn.addEventListener('click', () => {
         state.collapsed = !state.collapsed;
-        content.style.display = state.collapsed ? 'none' : '';
-        toggleBtn.textContent = state.collapsed ? '+' : '−';
+        api.setUiOption('collapsed', state.collapsed);
+        applyCollapsed();
+        // 展开时补画一次内容（收起状态下是不渲染的）
+        if (!state.collapsed) render();
     });
 
     const root = el('div', { class: 'stam-panel', id: 'stam-panel' }, [
         el('div', { class: 'stam-header' }, [
             el('span', { class: 'stam-title', text: '称呼管理器' }),
+            summarySpan,
             toggleBtn,
         ]),
         content,
@@ -1370,6 +1396,11 @@ export function createPanel(api) {
     }
 
     function render() {
+        // 收起状态下内容是不可见的，别白算一遍 DOM，只更新标题栏摘要
+        if (state.collapsed) {
+            updateSummary();
+            return;
+        }
         renderInject();
         renderRelations();
         renderCandidates();
@@ -1379,6 +1410,7 @@ export function createPanel(api) {
         filterBar.querySelectorAll('.stam-chip').forEach(chip => {
             chip.classList.toggle('stam-chip-active', chip.dataset.filter === state.filter);
         });
+        updateSummary();
     }
 
     /**
@@ -1386,12 +1418,18 @@ export function createPanel(api) {
      * 不重建关系表/关系图——否则用户正在输入或选圆心时会被打断。
      */
     function renderLight() {
+        if (state.collapsed) {
+            updateSummary();
+            return;
+        }
         renderInject();
         extractSection.render();
         autoSection.render();
+        updateSummary();
     }
 
     render();
+    applyCollapsed();
     return {
         root,
         render,

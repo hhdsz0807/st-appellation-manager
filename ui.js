@@ -104,21 +104,52 @@ function createExtractSection(api, setStatus) {
 
     const baseUrlInput = el('input', { type: 'text', id: 'stam-extract-baseurl', placeholder: 'https://api.example.com/v1' });
     baseUrlInput.value = settings0.custom.baseUrl;
-    baseUrlInput.addEventListener('change', () => api.setExtractCustom('baseUrl', baseUrlInput.value.trim()));
-
-    const modelInput = el('input', { type: 'text', id: 'stam-extract-model', placeholder: '模型名，例如 deepseek-chat' });
-    modelInput.value = settings0.custom.model;
-    modelInput.addEventListener('change', () => api.setExtractCustom('model', modelInput.value.trim()));
+    baseUrlInput.addEventListener('change', () => {
+        api.setExtractCustom('baseUrl', baseUrlInput.value.trim());
+        setStatus('地址变了，正在去拉模型列表…');
+        render();
+    });
 
     const apiKeyInput = el('input', { type: 'password', id: 'stam-extract-apikey', placeholder: 'API Key（明文存在酒馆设置里）', autocomplete: 'off' });
     apiKeyInput.value = settings0.custom.apiKey;
-    apiKeyInput.addEventListener('change', () => api.setExtractCustom('apiKey', apiKeyInput.value.trim()));
+    apiKeyInput.addEventListener('change', () => {
+        api.setExtractCustom('apiKey', apiKeyInput.value.trim());
+        // 之前因为没带对密钥没拉到列表，补上密钥后允许再自动试一次
+        if (!api.getExtractSettings().custom.models?.length) autoFetchedFor = null;
+        render();
+    });
+
+    // 模型名不让用户手打：从端点 /models 拉列表，用下拉选。
+    const modelSelect = el('select', { id: 'stam-extract-model' });
+    modelSelect.addEventListener('change', () => api.setExtractCustom('model', modelSelect.value));
+
+    const modelFallbackInput = el('input', { type: 'text', id: 'stam-extract-model-manual', placeholder: '手动填模型名（端点没有 /models 接口时才用）' });
+    modelFallbackInput.addEventListener('change', () => api.setExtractCustom('model', modelFallbackInput.value.trim()));
+    const modelFallbackField = el('div', { class: 'stam-field', id: 'stam-model-fallback' }, [modelFallbackInput]);
+
+    const refreshModelsBtn = button('重新拉取', async () => {
+        refreshModelsBtn.disabled = true;
+        await api.refreshModelList();
+        refreshModelsBtn.disabled = false;
+        render();
+    });
+    const modelHint = el('div', { class: 'stam-hint', id: 'stam-model-hint' });
+
+    const modelPickers = el('div', { class: 'stam-grid' }, [
+        field('模型名', modelSelect, '从端点自动拉取，不用手打'),
+        el('div', { class: 'stam-field' }, [
+            el('span', { class: 'stam-field-label', text: '　' }),
+            refreshModelsBtn,
+        ]),
+        modelFallbackField,
+    ]);
 
     const customBox = el('div', { class: 'stam-grid' }, [
         field('端点地址', baseUrlInput),
-        field('模型名', modelInput),
         field('API Key', apiKeyInput),
     ]);
+
+    const customSection = el('div', { id: 'stam-custom-section' }, [customBox, modelPickers, modelHint]);
 
     /* ---------- 分块 ---------- */
 
@@ -271,7 +302,7 @@ function createExtractSection(api, setStatus) {
                     fileInput,
                 ]),
                 field('用哪个模型', modeSelect, '「酒馆当前连接」= 你已经在酒馆里配好的那个模型，不用再填密钥'),
-                customBox,
+                customSection,
                 el('div', { class: 'stam-grid' }, [
                     field('每块字数', chunkInput, '越大越省请求，但模型容易看漏'),
                     field('最多几块', maxChunksInput, '一次最多发几次请求'),
@@ -311,7 +342,54 @@ function createExtractSection(api, setStatus) {
     /* ---------- 行为 ---------- */
 
     function syncMode() {
-        customBox.style.display = modeSelect.value === 'custom' ? '' : 'none';
+        const custom = modeSelect.value === 'custom';
+        customSection.style.display = custom ? '' : 'none';
+        if (custom) maybeAutoFetchModels();
+    }
+
+    /** 切到自定义端点且地址已填、列表还空的时候，自动去拉一次——用户不用自己点。 */
+    let autoFetchedFor = null;
+    function maybeAutoFetchModels() {
+        const settings = api.getExtractSettings();
+        const url = settings.custom.baseUrl;
+        if (!url) return;
+        if (settings.custom.models?.length) return;
+        if (api.getExtractUiState().modelListLoading) return;
+        // 每个地址只自动试一次：失败了也不反复重试，想再试就点「重新拉取」
+        if (autoFetchedFor === url) return;
+        autoFetchedFor = url;
+        api.refreshModelList({ silent: true }).finally(() => render());
+    }
+
+    function renderModelPicker(state) {
+        const settings = api.getExtractSettings();
+        const models = settings.custom.models ?? [];
+        const current = settings.custom.model ?? '';
+
+        modelSelect.textContent = '';
+        if (!models.length) {
+            modelSelect.append(el('option', { value: '', text: state.modelListLoading ? '正在拉取…' : '（先填地址和密钥）' }));
+            modelSelect.disabled = true;
+        } else {
+            modelSelect.disabled = false;
+            for (const id of models) {
+                modelSelect.append(el('option', { value: id, text: id }));
+            }
+            if (current && !models.includes(current)) {
+                modelSelect.append(el('option', { value: current, text: `${current}（已不在列表里）` }));
+            }
+            modelSelect.value = current || models[0];
+        }
+
+        // 端点没有 /models 接口时才需要手填，平时这个框藏起来
+        const needFallback = !models.length && !state.modelListLoading && Boolean(settings.custom.baseUrl);
+        modelFallbackField.style.display = needFallback ? '' : 'none';
+        if (needFallback) modelFallbackInput.value = current;
+
+        refreshModelsBtn.disabled = state.modelListLoading || !settings.custom.baseUrl;
+        modelHint.textContent = models.length
+            ? `端点返回 ${models.length} 个模型。换了地址会自动重新拉。`
+            : (state.modelListLoading ? '' : '填完端点地址和密钥会自动拉取模型列表；拉不到就在下面手填。');
     }
 
     function updatePlan() {
@@ -439,6 +517,7 @@ function createExtractSection(api, setStatus) {
         const state = api.getExtractUiState();
         syncMode();
         renderNovelPicker(state);
+        renderModelPicker(state);
         injectNovelCheck.checked = Boolean(state.injectNovel);
         renderProgress(state);
         renderLog(state);

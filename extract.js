@@ -24,7 +24,74 @@ export function joinChatCompletionsUrl(baseUrl) {
     if (!raw) return '';
     const trimmed = raw.replace(/\/+$/, '');
     if (/\/chat\/completions$/i.test(trimmed)) return trimmed;
+    if (/\/models$/i.test(trimmed)) return trimmed.replace(/\/models$/i, '/chat/completions');
     return `${trimmed}/chat/completions`;
+}
+
+/** 拼 /models 地址：用来拉模型列表，不让用户手打模型名。 */
+export function joinModelsUrl(baseUrl) {
+    const raw = String(baseUrl ?? '').trim();
+    if (!raw) return '';
+    const trimmed = raw.replace(/\/+$/, '');
+    if (/\/models$/i.test(trimmed)) return trimmed;
+    if (/\/chat\/completions$/i.test(trimmed)) return trimmed.replace(/\/chat\/completions$/i, '/models');
+    return `${trimmed}/models`;
+}
+
+/**
+ * 从各家五花八门的 /models 响应里挖出模型 id 列表。
+ * OpenAI / vLLM / Ollama / LM Studio / one-api 的字段名都不一样，这里都认。
+ */
+export function pickModelIds(data) {
+    const list = Array.isArray(data)
+        ? data
+        : (Array.isArray(data?.data) ? data.data
+            : (Array.isArray(data?.models) ? data.models : []));
+    const ids = [];
+    for (const entry of list) {
+        const id = typeof entry === 'string'
+            ? entry
+            : (entry?.id ?? entry?.name ?? entry?.model ?? entry?.model_name);
+        const clean = String(id ?? '').trim();
+        if (clean && !ids.includes(clean)) ids.push(clean);
+    }
+    return ids.sort((a, b) => a.localeCompare(b, 'en'));
+}
+
+/** 拉取端点支持的模型列表。fetchImpl 可注入，方便离线测。 */
+export async function fetchModelList({ baseUrl, apiKey, fetchImpl, signal } = {}) {
+    const url = joinModelsUrl(baseUrl);
+    if (!url) throw new Error('先填端点地址');
+    const doFetch = fetchImpl ?? globalThis.fetch;
+    if (typeof doFetch !== 'function') throw new Error('当前环境没有 fetch');
+
+    const response = await doFetch(url, {
+        method: 'GET',
+        headers: {
+            Accept: 'application/json',
+            ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+        },
+        signal,
+    });
+    if (!response.ok) {
+        const detail = String(await response.text().catch(() => '')).slice(0, 200);
+        throw new Error(`模型列表接口返回 HTTP ${response.status}${detail ? `：${detail}` : ''}`);
+    }
+    const ids = pickModelIds(await response.json());
+    if (!ids.length) throw new Error('模型列表接口没有返回任何模型');
+    return ids;
+}
+
+/**
+ * 拉完列表后决定选哪个：能保留就保留，否则只有唯一模型就用它，再否则用第一个。
+ * 这样用户最多只需要点一次「刷新」，不用手打。
+ */
+export function pickDefaultModel(models, current) {
+    const list = Array.isArray(models) ? models : [];
+    const kept = String(current ?? '').trim();
+    if (kept && list.includes(kept)) return kept;
+    if (list.length) return list[0];
+    return kept;
 }
 
 /** 从 OpenAI 兼容响应里取正文；结构不对就抛出可读错误。 */

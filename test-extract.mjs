@@ -10,8 +10,12 @@ import {
     createCaller,
     createCustomCaller,
     createStCaller,
+    fetchModelList,
     joinChatCompletionsUrl,
+    joinModelsUrl,
     pickChatCompletionContent,
+    pickDefaultModel,
+    pickModelIds,
     runExtraction,
 } from './extract.js';
 import { autoMapNames, buildParticipants, collectNames, mergeExtractResults } from './core.js';
@@ -95,6 +99,90 @@ await check('结构不对时报可读错误', () => {
         assertIncludes(error.message, 'choices[0].message.content');
     }
     assert(threw, '应抛错');
+});
+
+console.log('\n模型列表（不让用户手打模型名）');
+
+await check('/models 地址拼接', () => {
+    assertEqual(joinModelsUrl('https://api.example.com/v1'), 'https://api.example.com/v1/models');
+    assertEqual(joinModelsUrl('https://api.example.com/v1/'), 'https://api.example.com/v1/models');
+    assertEqual(joinModelsUrl('https://api.example.com/v1/models'), 'https://api.example.com/v1/models');
+    assertEqual(joinModelsUrl('https://api.example.com/v1/chat/completions'), 'https://api.example.com/v1/models');
+    assertEqual(joinModelsUrl('  '), '');
+});
+await check('反过来，填 /models 也能推出 /chat/completions', () => {
+    assertEqual(joinChatCompletionsUrl('https://api.example.com/v1/models'), 'https://api.example.com/v1/chat/completions');
+});
+await check('认 OpenAI 的 {data:[{id}]}', () => {
+    assertEqual(pickModelIds({ data: [{ id: 'gpt-4o' }, { id: 'gpt-4o-mini' }] }), ['gpt-4o', 'gpt-4o-mini']);
+});
+await check('认裸数组、{models:[{name}]}、字符串数组', () => {
+    assertEqual(pickModelIds(['b', 'a']), ['a', 'b']);
+    assertEqual(pickModelIds({ models: [{ name: 'qwen2.5' }] }), ['qwen2.5']);
+    assertEqual(pickModelIds({ data: [{ model: 'deepseek-chat' }] }), ['deepseek-chat']);
+});
+await check('去重并丢掉空值，结果排序稳定', () => {
+    assertEqual(pickModelIds({ data: [{ id: 'x' }, { id: 'x' }, { id: '' }, { id: '  ' }, { nothing: 1 }] }), ['x']);
+});
+await check('没有模型时返回空数组', () => {
+    assertEqual(pickModelIds(null), []);
+    assertEqual(pickModelIds({ data: [] }), []);
+});
+await check('fetchModelList 带上 Bearer 并发 GET', async () => {
+    let seen = null;
+    const models = await fetchModelList({
+        baseUrl: 'https://api.example.com/v1',
+        apiKey: 'sk-x',
+        fetchImpl: async (url, init) => {
+            seen = { url, init };
+            return { ok: true, status: 200, json: async () => ({ data: [{ id: 'm1' }, { id: 'm2' }] }), text: async () => '' };
+        },
+    });
+    assertEqual(seen.url, 'https://api.example.com/v1/models');
+    assertEqual(seen.init.method, 'GET');
+    assertEqual(seen.init.headers.Authorization, 'Bearer sk-x');
+    assertEqual(models, ['m1', 'm2']);
+});
+await check('fetchModelList 的错误带状态码和响应片段', async () => {
+    let message = '';
+    try {
+        await fetchModelList({
+            baseUrl: 'https://x/v1',
+            fetchImpl: async () => ({ ok: false, status: 404, text: async () => 'not found', json: async () => ({}) }),
+        });
+    } catch (error) {
+        message = error.message;
+    }
+    assertIncludes(message, '404');
+    assertIncludes(message, 'not found');
+});
+await check('没填地址直接报错，不发请求', async () => {
+    let threw = false;
+    try {
+        await fetchModelList({ baseUrl: '', fetchImpl: async () => { throw new Error('不该被调用'); } });
+    } catch (error) {
+        threw = true;
+        assertIncludes(error.message, '端点地址');
+    }
+    assert(threw, '应报错');
+});
+await check('列表拉回来但没有模型时报可读错误', async () => {
+    let message = '';
+    try {
+        await fetchModelList({
+            baseUrl: 'https://x/v1',
+            fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ data: [] }), text: async () => '' }),
+        });
+    } catch (error) {
+        message = error.message;
+    }
+    assertIncludes(message, '没有返回任何模型');
+});
+await check('自动选模型：能保留就保留，否则用列表第一个', () => {
+    assertEqual(pickDefaultModel(['a', 'b'], 'b'), 'b', '列表里还有就保留用户的选择');
+    assertEqual(pickDefaultModel(['a', 'b'], 'z'), 'a', '已不在列表里就退回第一个');
+    assertEqual(pickDefaultModel(['only'], ''), 'only');
+    assertEqual(pickDefaultModel([], 'kept'), 'kept', '拉不到列表时不要清掉已有值');
 });
 
 /* ---------------- 自定义端点调用器 ---------------- */

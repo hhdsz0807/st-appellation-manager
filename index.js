@@ -46,7 +46,7 @@ import {
     scanCandidates,
     setRelation as setRelationPure,
 } from './core.js';
-import { createCaller, runExtraction } from './extract.js';
+import { createCaller, fetchModelList, pickDefaultModel, runExtraction } from './extract.js';
 import { createPanel } from './ui.js';
 
 /** 注入用的键名；酒馆内部用它区分不同扩展的注入内容。 */
@@ -72,6 +72,7 @@ const extractRuntime = {
     sourceNames: new Map(),  // novelId -> 文件名
     running: false,
     abortRequested: false,
+    modelListLoading: false,
     progress: null,
     log: [],
     startedAt: 0,
@@ -392,6 +393,7 @@ const api = {
             textChars: activeText().length,
             sourceName: extractRuntime.sourceNames.get(novelId) ?? '',
             injectNovel: Boolean(settings.extract.injectNovel),
+            modelListLoading: extractRuntime.modelListLoading,
         };
     },
     getExtractText() {
@@ -430,8 +432,39 @@ const api = {
     },
     setExtractCustom(key, value) {
         const settings = getSettings();
-        settings.extract.custom = { ...settings.extract.custom, [key]: value };
+        const custom = { ...settings.extract.custom, [key]: value };
+        // 换了端点，之前拉到的模型列表就不作数了。列表由界面层按需重新拉（每个地址只自动试一次）。
+        if (key === 'baseUrl') custom.models = [];
+        settings.extract.custom = custom;
         saveSettings();
+    },
+    /**
+     * 从端点拉模型列表，存进设置里给下拉用。
+     * 用户永远不需要手打模型名——填了地址和密钥，这一步自动发生。
+     */
+    async refreshModelList({ silent = false } = {}) {
+        const settings = getSettings();
+        const custom = settings.extract.custom;
+        if (!custom.baseUrl) {
+            if (!silent) panel?.setStatus('先填端点地址');
+            return { ok: false, error: '没填端点地址' };
+        }
+        extractRuntime.modelListLoading = true;
+        panel?.renderExtract();
+        try {
+            const models = await fetchModelList({ baseUrl: custom.baseUrl, apiKey: custom.apiKey });
+            const model = pickDefaultModel(models, settings.extract.custom.model);
+            settings.extract.custom = { ...settings.extract.custom, models, model };
+            saveSettings();
+            panel?.renderExtract();
+            if (!silent) panel?.setStatus(`拉到 ${models.length} 个模型，已选「${model}」`);
+            return { ok: true, models, model };
+        } catch (error) {
+            if (!silent) panel?.setStatus(`拉模型列表失败：${error.message}`);
+            return { ok: false, error: error.message };
+        } finally {
+            extractRuntime.modelListLoading = false;
+        }
     },
 
     /* ---------------- 小说管理 ---------------- */
@@ -547,7 +580,15 @@ const api = {
         const ctx = host();
         if (!ctx) return { started: false, reason: '取不到酒馆上下文' };
 
-        const extract = getSettings().extract;
+        let extract = getSettings().extract;
+        if (extract.mode === 'custom' && !extract.custom.model) {
+            // 还没选模型就先去拉一次，绝不逼用户手打模型名
+            const pulled = await api.refreshModelList({ silent: true });
+            if (!pulled.ok) {
+                return { started: false, reason: `没法自动确定模型名：${pulled.error}。检查一下端点地址和密钥。` };
+            }
+            extract = getSettings().extract;
+        }
         if (!activeNovel()) {
             // 没有小说就直接建一部，省掉「先点新建」这一步。
             const created = api.createNovel(deriveNovelName());

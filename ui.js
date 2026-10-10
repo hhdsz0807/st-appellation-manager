@@ -3,7 +3,10 @@
  *
  * 只负责把数据画出来、把用户操作交给 api；不直接读写酒馆状态。
  * 所有 id / class 都带 stam- 前缀，避免和别的扩展撞车。
+ * 图形几何参数与布局算法在 core.js 里（纯函数、可离线测），这里只管画。
  */
+
+import { GRAPH_GEOMETRY, graphChordControl, graphLayout, graphSpokeLabels } from './core.js';
 
 const STAGE_SUGGESTIONS = ['初见', '认识', '熟悉', '亲密', '恋人', '家人', '搭档', '敌对', '决裂'];
 
@@ -48,6 +51,121 @@ function button(labelText, onClick, extraClass = '') {
         text: labelText,
         onclick: onClick,
     });
+}
+
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
+/**
+ * 放射状关系图。
+ *
+ * 选一个角色当圆心，其他人摆在周围；每条辐条标两个方向：
+ *   → 圆心这样叫对方     ← 对方这样叫圆心
+ * 外围角色之间如果也有称呼，额外画一条往外鼓的弧线（角色太多就不画，免得糊成一团）。
+ *
+ * 坐标系统一用 0–100 的百分比，容器靠 CSS 撑成正方形，所以图形不会被拉变形。
+ */
+function renderRelationGraph(container, model, { onRecenter, emptyHint } = {}) {
+    container.textContent = '';
+    if (!model?.center || !model?.nodes?.length) {
+        container.append(el('div', { class: 'stam-hint', text: emptyHint ?? '没有可画的关系。' }));
+        return;
+    }
+    if (!model.spokes.length) {
+        container.append(el('div', { class: 'stam-hint', text: '当前只有一个人，没有可以放射的关系。' }));
+        return;
+    }
+
+    const { cx: CX, cy: CY } = GRAPH_GEOMETRY;
+    const positions = new Map([[model.center.key, { x: CX, y: CY }]]);
+    const ring = graphLayout(model.spokes.length);
+    model.spokes.forEach((spoke, i) => {
+        positions.set(spoke.key, ring[i]);
+    });
+
+    const svg = document.createElementNS(SVG_NS, 'svg');
+    svg.setAttribute('class', 'stam-graph-svg');
+    svg.setAttribute('viewBox', '0 0 100 100');
+    svg.setAttribute('preserveAspectRatio', 'none');
+
+    const edge = (tag, attrs, cls) => {
+        const node = document.createElementNS(SVG_NS, tag);
+        for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, String(value));
+        node.setAttribute('class', cls);
+        node.setAttribute('vector-effect', 'non-scaling-stroke');
+        if (tag === 'path') node.setAttribute('fill', 'none');
+        svg.append(node);
+    };
+
+    const layer = el('div', { class: 'stam-graph-layer' });
+    const labelAt = (x, y, text, cls) => el('div', {
+        class: cls,
+        style: { left: `${x}%`, top: `${y}%` },
+        text,
+    });
+
+    // 辐条：圆心到每个人
+    for (const spoke of model.spokes) {
+        const pos = positions.get(spoke.key);
+        const has = Boolean(spoke.outward || spoke.inward);
+        edge('line', { x1: CX, y1: CY, x2: pos.x, y2: pos.y },
+            `stam-edge${has ? '' : ' stam-edge-empty'}`);
+    }
+
+    // 外围之间的弦：从圆心往外鼓，避免正好穿过圆心
+    for (const chord of model.chords) {
+        const a = positions.get(chord.a);
+        const b = positions.get(chord.b);
+        if (!a || !b) continue;
+        const { mid, control } = graphChordControl(a, b, GRAPH_GEOMETRY);
+        edge('path', { d: `M ${a.x} ${a.y} Q ${control.x} ${control.y} ${b.x} ${b.y}` },
+            'stam-edge stam-edge-chord');
+        const lines = [`${chord.aName}→${chord.bName}：${chord.aToB?.call ?? '—'}`];
+        if (chord.bToA) lines.push(`${chord.bName}→${chord.aName}：${chord.bToA.call}`);
+        layer.append(labelAt(mid.x, mid.y, lines.join('\n'), 'stam-graph-chord-label'));
+    }
+
+    // 双向称呼标签，分居辐条两侧
+    for (const spoke of model.spokes) {
+        const pos = positions.get(spoke.key);
+        const { outward, inward } = graphSpokeLabels({ x: CX, y: CY }, pos, GRAPH_GEOMETRY);
+        if (spoke.outward) {
+            layer.append(labelAt(outward.x, outward.y, `→ ${spoke.outward.call}`, 'stam-graph-label stam-graph-label-out'));
+        }
+        if (spoke.inward) {
+            layer.append(labelAt(inward.x, inward.y, `← ${spoke.inward.call}`, 'stam-graph-label stam-graph-label-in'));
+        }
+    }
+
+    // 节点
+    layer.append(el('div', {
+        class: `stam-node stam-node-center${model.center.kind === 'user' ? ' stam-node-user' : ''}`,
+        style: { left: `${CX}%`, top: `${CY}%` },
+        title: `${model.center.name}（圆心）`,
+    }, [
+        el('span', { class: 'stam-node-name', text: model.center.name }),
+        el('span', { class: 'stam-node-tag', text: '圆心' }),
+    ]));
+
+    for (const spoke of model.spokes) {
+        const pos = positions.get(spoke.key);
+        const node = el('div', {
+            class: `stam-node${spoke.kind === 'user' ? ' stam-node-user' : ''}`,
+            style: { left: `${pos.x}%`, top: `${pos.y}%` },
+            title: `点一下，把 ${spoke.name} 换成圆心`,
+        }, [el('span', { class: 'stam-node-name', text: spoke.name })]);
+        if (onRecenter) {
+            node.addEventListener('click', () => onRecenter(spoke.key));
+        }
+        layer.append(node);
+    }
+
+    container.append(el('div', { class: 'stam-graph' }, [svg, layer]));
+
+    const hints = ['→ 圆心这样叫对方　← 对方这样叫圆心　点角色名可换成圆心'];
+    if (model.chordsSkipped) {
+        hints.push(`角色较多，${model.chordsSkipped} 条外围关系没画，切到「表」能看全`);
+    }
+    container.append(el('div', { class: 'stam-hint stam-graph-legend', text: hints.join('；') }));
 }
 
 /**
@@ -206,6 +324,11 @@ function createExtractSection(api, setStatus) {
 
     const resultBox = el('div', { class: 'stam-extract-results' });
     const mappingBox = el('div', { class: 'stam-mapping' });
+    // 称呼表的两种看法：放射图（默认）/ 表格
+    const novelUi = { view: api.getSettings().ui.novelView ?? 'graph', center: null };
+    const novelViewBar = el('div', { class: 'stam-toolbar' });
+    const novelCenterBar = el('div', { class: 'stam-toolbar' });
+    const novelGraphBox = el('div', { class: 'stam-graph-box' });
 
     const actions = el('div', { class: 'stam-toolbar' }, [
         button('写进当前聊天的称呼表', () => {
@@ -325,6 +448,9 @@ function createExtractSection(api, setStatus) {
             button('导入小说 JSON', () => api.importNovelFile()),
             el('label', { class: 'stam-check' }, [injectNovelCheck, el('span', { text: '把这张表一起注入提示词' })]),
         ]),
+        novelViewBar,
+        novelCenterBar,
+        novelGraphBox,
         resultBox,
         el('details', { class: 'stam-extract' }, [
             el('summary', { text: '把这个称呼表用到当前聊天（可选）' }),
@@ -432,7 +558,26 @@ function createExtractSection(api, setStatus) {
     }
 
     function renderResults(state) {
+        // 视图切换
+        novelViewBar.textContent = '';
+        novelViewBar.append(
+            el('span', { class: 'stam-hint', text: '看：' }),
+            ...['graph', 'table'].map(view => el('button', {
+                class: `stam-chip${novelUi.view === view ? ' stam-chip-active' : ''}`,
+                type: 'button',
+                text: view === 'graph' ? '关系图' : '表格',
+                onclick: () => {
+                    novelUi.view = view;
+                    api.setUiOption('novelView', view);
+                    render();
+                },
+            })),
+        );
+
         resultBox.textContent = '';
+        novelCenterBar.textContent = '';
+        novelGraphBox.textContent = '';
+
         const table = state.table ?? [];
         const countLabel = document.getElementById('stam-table-count');
         if (countLabel) {
@@ -441,12 +586,52 @@ function createExtractSection(api, setStatus) {
                 : '';
         }
         if (!table.length) {
+            novelCenterBar.style.display = 'none';
+            novelGraphBox.style.display = 'none';
+            resultBox.style.display = '';
             resultBox.append(el('div', {
                 class: 'stam-hint',
                 text: state.novel ? '这部小说还没有称呼。粘正文进来跑一次提取。' : '还没有小说。点上面「新建」，或直接粘正文跑提取（会自动建一部）。',
             }));
             return;
         }
+
+        if (novelUi.view === 'graph') {
+            resultBox.style.display = 'none';
+            novelCenterBar.style.display = '';
+            novelGraphBox.style.display = '';
+
+            const names = [];
+            for (const row of table) {
+                if (!names.includes(row.from)) names.push(row.from);
+                if (!names.includes(row.to)) names.push(row.to);
+            }
+            const known = novelUi.center && names.some(n => `name:${n}` === novelUi.center);
+            const centerKey = known ? novelUi.center : `name:${names[0]}`;
+            novelUi.center = centerKey;
+
+            const centerSelect = el('select', { class: 'stam-map-select' },
+                names.map(name => el('option', { value: `name:${name}`, text: name })));
+            centerSelect.value = centerKey;
+            centerSelect.addEventListener('change', () => {
+                novelUi.center = centerSelect.value;
+                render();
+            });
+            novelCenterBar.append(el('span', { class: 'stam-hint', text: '圆心：' }), centerSelect);
+
+            renderRelationGraph(novelGraphBox, api.getNovelGraphModel(centerKey), {
+                onRecenter: key => {
+                    novelUi.center = key;
+                    render();
+                },
+            });
+            return;
+        }
+
+        novelCenterBar.style.display = 'none';
+        novelGraphBox.style.display = 'none';
+        resultBox.style.display = '';
+
         resultBox.append(el('div', { class: 'stam-x-rows' }, [
             el('div', { class: 'stam-x-row stam-x-head' }, [
                 el('div', { text: '称呼方 → 被称呼方' }),
@@ -468,8 +653,7 @@ function createExtractSection(api, setStatus) {
         if (table.length > 400) {
             resultBox.append(el('div', { class: 'stam-hint', text: `还有 ${table.length - 400} 条未显示（复制表格或导出 JSON 能拿到全部）。` }));
         }
-        const withEvidence = table.find(row => row.evidence?.length);
-        if (withEvidence) {
+        if (table.some(row => row.evidence?.length)) {
             resultBox.append(el('details', { class: 'stam-help' }, [
                 el('summary', { text: '看几条原文证据（核对模型有没有编）' }),
                 el('div', {}, table.filter(r => r.evidence?.length).slice(0, 12).map(row =>
@@ -559,6 +743,9 @@ export function createPanel(api) {
         candidates: [],
         issues: [],
         status: '',
+        // 关系默认用放射图看，表格留着精确编辑
+        relationsView: api.getSettings().ui.relationsView ?? 'graph',
+        graphCenter: null,
     };
 
     /* ---------------- 注入设置 ---------------- */
@@ -833,15 +1020,70 @@ export function createPanel(api) {
     function renderRelations() {
         relationsBox.textContent = '';
         const participants = api.getParticipants();
-        const pairs = visiblePairs();
 
-        relationsBox.append(el('datalist', { id: 'stam-stage-list' },
-            STAGE_SUGGESTIONS.map(s => el('option', { value: s }))));
+        const viewBar = el('div', { class: 'stam-toolbar' }, [
+            el('span', { class: 'stam-hint', text: '看：' }),
+            ...['graph', 'table'].map(view => el('button', {
+                class: `stam-chip${state.relationsView === view ? ' stam-chip-active' : ''}`,
+                type: 'button',
+                text: view === 'graph' ? '关系图' : '表格',
+                onclick: () => {
+                    state.relationsView = view;
+                    api.setUiOption('relationsView', view);
+                    render();
+                },
+            })),
+        ]);
+        relationsBox.append(viewBar);
+        // 筛选只对表格有意义
+        filterBar.style.display = state.relationsView === 'graph' ? 'none' : '';
 
         if (participants.length < 2) {
             relationsBox.append(el('div', { class: 'stam-hint', text: '当前没有选中角色，先打开一张角色卡或一个群聊。' }));
             return;
         }
+
+        if (state.relationsView === 'graph') {
+            const known = state.graphCenter && participants.some(p => p.key === state.graphCenter);
+            const centerKey = known ? state.graphCenter : api.defaultGraphCenter();
+            state.graphCenter = centerKey;
+
+            const centerSelect = el('select', { class: 'stam-map-select' },
+                participants.map(p => el('option', {
+                    value: p.key,
+                    text: p.kind === 'user' ? `用户：${p.name}` : p.name,
+                })));
+            centerSelect.value = centerKey ?? '';
+            centerSelect.addEventListener('change', () => {
+                state.graphCenter = centerSelect.value;
+                render();
+            });
+            relationsBox.append(el('div', { class: 'stam-toolbar' }, [
+                el('span', { class: 'stam-hint', text: '圆心：' }),
+                centerSelect,
+            ]));
+
+            const graphBox = el('div', { class: 'stam-graph-box' });
+            relationsBox.append(graphBox);
+            renderRelationGraph(graphBox, api.getGraphModel(centerKey), {
+                onRecenter: key => {
+                    state.graphCenter = key;
+                    render();
+                },
+                emptyHint: '还没有登记任何称呼。点上面「表格」手工填，或者用最上面的「从正文提取」。',
+            });
+
+            const orphans = api.getOrphans();
+            if (orphans.length) {
+                relationsBox.append(el('div', { class: 'stam-hint', text: `另外还有 ${orphans.length} 条关系指向已不在当前聊天里的角色，已隐藏。` }));
+            }
+            return;
+        }
+
+        const pairs = visiblePairs();
+        relationsBox.append(el('datalist', { id: 'stam-stage-list' },
+            STAGE_SUGGESTIONS.map(s => el('option', { value: s }))));
+
         if (!pairs.length) {
             relationsBox.append(el('div', { class: 'stam-hint', text: '这个筛选下没有可编辑的关系。' }));
             return;
@@ -921,8 +1163,17 @@ export function createPanel(api) {
         });
     }
 
+    /**
+     * 轻量刷新：消息类事件只更新选项和小说区，
+     * 不重建关系表/关系图——否则用户正在输入或选圆心时会被打断。
+     */
+    function renderLight() {
+        renderInject();
+        extractSection.render();
+    }
+
     render();
-    return { root, render, renderExtract: extractSection.render, setStatus };
+    return { root, render, renderLight, renderExtract: extractSection.render, setStatus };
 }
 
 export default createPanel;

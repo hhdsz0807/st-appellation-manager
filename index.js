@@ -15,6 +15,7 @@ import {
     buildNovelTable,
     buildParticipants,
     buildPatches,
+    buildRelationGraph,
     chunkText,
     clearAllRelations,
     clearRelation,
@@ -38,6 +39,7 @@ import {
     normalizeNovel,
     normalizeNovels,
     normalizeSettings,
+    novelGraphInput,
     novelTableToText,
     parseRelationKey,
     patchesToRelations,
@@ -563,6 +565,35 @@ const api = {
     setMapping(name, key) {
         writeChatMapping(activeNovelId(), name, key);
     },
+
+    /* ---------------- 关系图 ---------------- */
+
+    /** 当前聊天的关系图模型：以 centerKey 为圆心。 */
+    getGraphModel(centerKey) {
+        const settings = getSettings();
+        return buildRelationGraph({
+            participants: participantsOf(),
+            chatState: readChatState(),
+            library: settings.library,
+            centerKey,
+        });
+    },
+    /** 当前小说称呼表的关系图模型（纯人名级，没有「用户」）。 */
+    getNovelGraphModel(centerKey) {
+        const table = buildNovelTable(activeNovel()?.results ?? []);
+        return buildRelationGraph({ ...novelGraphInput(table), chatState: null, centerKey });
+    },
+    /** 默认圆心：当前正在说话的那个角色，单聊里就是这张卡。 */
+    defaultGraphCenter() {
+        const ctx = host();
+        const participants = participantsOf();
+        return focusParticipantKey(participants, ctx?.name2) ?? participants[0]?.key ?? null;
+    },
+    setUiOption(key, value) {
+        const settings = getSettings();
+        settings.ui = { ...settings.ui, [key]: value };
+        saveSettings();
+    },
     abortExtract() {
         if (!extractRuntime.running) return;
         extractRuntime.abortRequested = true;
@@ -1058,11 +1089,23 @@ function bindEvents() {
         refreshInjection();
         panel?.render();
     };
-    for (const name of ['CHAT_CHANGED', 'MESSAGE_RECEIVED', 'MESSAGE_SENT', 'GENERATION_AFTER_COMMANDS', 'GROUP_UPDATED', 'CHARACTER_EDITED']) {
+    const refreshLight = () => {
+        refreshInjection();
+        panel?.renderLight();
+    };
+    // 聊天换了、群成员变了：整块重建
+    for (const name of ['CHAT_CHANGED', 'GROUP_UPDATED', 'CHARACTER_EDITED']) {
         const type = types[name];
         if (!type) continue;
         events.on(type, refreshAll);
         boundListeners.push({ eventBus: events, type, handler: refreshAll });
+    }
+    // 收发消息、生成前：只轻量刷新，别打断正在编辑关系的人
+    for (const name of ['MESSAGE_RECEIVED', 'MESSAGE_SENT', 'GENERATION_AFTER_COMMANDS']) {
+        const type = types[name];
+        if (!type) continue;
+        events.on(type, refreshLight);
+        boundListeners.push({ eventBus: events, type, handler: refreshLight });
     }
     if (types.APP_READY) {
         events.on(types.APP_READY, startPanelMounting);

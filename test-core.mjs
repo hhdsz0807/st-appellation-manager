@@ -567,6 +567,176 @@ check('同一部小说用到不同聊天时，映射各自独立（不串味）'
     assertEqual(chatB.novelMapping[novel.id], undefined);
 });
 
+/* ---------------- 放射状关系图 ---------------- */
+
+console.log('\n放射状关系图');
+
+const graphParticipants = mod.buildParticipants(hostGroup); // 小陆 / 白鹭 / 星野
+const graphState = (() => {
+    let s = mod.emptyChatState();
+    s = mod.setRelation(s, BAILU, XINGYE, { call: '小星星' });      // 白鹭 → 星野
+    s = mod.setRelation(s, XINGYE, USER_KEY, { call: '陆哥' });     // 星野 → 小陆
+    s = mod.setRelation(s, USER_KEY, BAILU, { call: '小白' });      // 小陆 → 白鹭
+    return s;
+})();
+
+check('圆心默认为第一个参与者；指定了就按指定的来', () => {
+    assertEqual(mod.buildRelationGraph({ participants: graphParticipants }).center.key, USER_KEY);
+    assertEqual(mod.buildRelationGraph({ participants: graphParticipants, centerKey: BAILU }).center.key, BAILU);
+});
+check('没有参与者时返回空图，不抛错', () => {
+    const graph = mod.buildRelationGraph({ participants: [] });
+    assertEqual(graph.center, null);
+    assertEqual(graph.spokes, []);
+});
+check('以白鹭为圆心：辐射出小陆和星野，方向不串', () => {
+    const graph = mod.buildRelationGraph({ participants: graphParticipants, chatState: graphState, centerKey: BAILU });
+    assertEqual(graph.spokes.map(s => s.name).sort(), ['小陆', '星野']);
+
+    const toXingye = graph.spokes.find(s => s.name === '星野');
+    assertEqual(toXingye.outward.call, '小星星', '白鹭 → 星野 应该是「小星星」');
+    assertEqual(toXingye.inward, null, '星野没这么叫过白鹭，应该是空');
+
+    const toUser = graph.spokes.find(s => s.name === '小陆');
+    assertEqual(toUser.outward, null, '白鹭没这么叫过小陆');
+});
+check('双向都有称呼时两个方向都带上', () => {
+    let s = graphState;
+    s = mod.setRelation(s, XINGYE, BAILU, { call: '白鹭姐' });
+    const graph = mod.buildRelationGraph({ participants: graphParticipants, chatState: s, centerKey: BAILU });
+    const toXingye = graph.spokes.find(sp => sp.name === '星野');
+    assertEqual(toXingye.outward.call, '小星星');
+    assertEqual(toXingye.inward.call, '白鹭姐');
+});
+check('外围之间的称呼会画成弦（角色不多时）', () => {
+    const graph = mod.buildRelationGraph({ participants: graphParticipants, chatState: graphState, centerKey: BAILU });
+    assertEqual(graph.chords.length, 1, '星野 → 小陆 这条该出现');
+    assertEqual(graph.chords[0].bToA.call, '陆哥');
+    assertEqual(graph.chords[0].aToB, null);
+});
+check('角色太多时不画弦，但如实报出省掉了几条', () => {
+    const many = [{ key: USER_KEY, name: '我', kind: 'user' }];
+    for (let i = 0; i < 7; i += 1) many.push({ key: `char:c${i}`, name: `角色${i}`, kind: 'character' });
+    let s = mod.emptyChatState();
+    s = mod.setRelation(s, 'char:c1', 'char:c2', { call: '甲' });
+    s = mod.setRelation(s, 'char:c3', 'char:c4', { call: '乙' });
+    const graph = mod.buildRelationGraph({ participants: many, chatState: s, centerKey: USER_KEY });
+    assertEqual(graph.chords.length, 0);
+    assertEqual(graph.chordsSkipped, 2, '该如实说有两对没画');
+});
+check('全局默认库里的称呼也算数（标出来源是库）', () => {
+    const library = { [mod.relationKey(BAILU, XINGYE)]: { call: '星星', aliases: [], stage: '', note: '' } };
+    const graph = mod.buildRelationGraph({ participants: graphParticipants, library, centerKey: BAILU });
+    const toXingye = graph.spokes.find(s => s.name === '星野');
+    assertEqual(toXingye.outward.call, '星星');
+    assertEqual(toXingye.outward.source, 'library');
+});
+check('小说称呼表能喂给同一个图：键加前缀、方向正确', () => {
+    const table = mod.buildNovelTable(NOVEL_RESULTS);
+    const input = mod.novelGraphInput(table);
+    assertEqual(input.participants.map(p => p.name).sort(), ['小陆', '星野', '白鹭']);
+    assertEqual(input.participants.every(p => p.key.startsWith('name:')), true);
+
+    const graph = mod.buildRelationGraph({ ...input, centerKey: 'name:白鹭' });
+    const toXingye = graph.spokes.find(s => s.name === '星野');
+    assertEqual(toXingye.outward.call, '小星星');
+    assertEqual(toXingye.inward, null);
+    // 星野 → 小陆 是外围两人的关系，走弦
+    const toXiaolu = graph.spokes.find(s => s.name === '小陆');
+    assertEqual(toXiaolu.outward, null);
+    assertEqual(toXiaolu.inward, null);
+    assertEqual(graph.chords.length, 1);
+    assertEqual(graph.chords[0].aName, '星野');
+    assertEqual(graph.chords[0].bName, '小陆');
+    assertEqual(graph.chords[0].aToB.call, '陆哥');
+    assertEqual(graph.chords[0].bToA, null);
+});
+check('空表喂进去得到空图，不抛错', () => {
+    const input = mod.novelGraphInput([]);
+    assertEqual(input.participants, []);
+    assertEqual(mod.buildRelationGraph(input).center, null);
+});
+
+console.log('\n关系图几何（这部分看不到渲染，只能靠算）');
+
+const G = mod.GRAPH_GEOMETRY;
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+check('外围节点均匀排布，且都落在 0–100 的框里', () => {
+    for (const count of [1, 2, 3, 4, 5, 8]) {
+        const ring = mod.graphLayout(count);
+        assertEqual(ring.length, count);
+        for (const p of ring) {
+            assert(Math.abs(dist(p, { x: G.cx, y: G.cy }) - G.radius) < 1e-9, `半径应为 ${G.radius}`);
+            assert(p.x > 0 && p.x < 100 && p.y > 0 && p.y < 100, `越界：${JSON.stringify(p)}`);
+        }
+        // 彼此不能重合
+        for (let i = 0; i < ring.length; i += 1) {
+            for (let j = i + 1; j < ring.length; j += 1) {
+                assert(dist(ring[i], ring[j]) > 1, '节点重合了');
+            }
+        }
+    }
+});
+check('第一个节点在正上方，四个节点分别在上右下左', () => {
+    assert(Math.abs(mod.graphLayout(1)[0].x - G.cx) < 1e-9, '单节点应在正上方');
+    assert(mod.graphLayout(1)[0].y < G.cy, '单节点应在圆心上方');
+    const four = mod.graphLayout(4);
+    assert(Math.abs(four[0].x - G.cx) < 1e-9 && four[0].y < G.cy, '第 0 个在上');
+    assert(four[1].x > G.cx && Math.abs(four[1].y - G.cy) < 1e-9, '第 1 个在右');
+    assert(Math.abs(four[2].x - G.cx) < 1e-9 && four[2].y > G.cy, '第 2 个在下');
+    assert(four[3].x < G.cx && Math.abs(four[3].y - G.cy) < 1e-9, '第 3 个在左');
+});
+check('两个方向的标签分居连线两侧，不会叠在一起', () => {
+    const from = { x: G.cx, y: G.cy };
+    for (const to of mod.graphLayout(6)) {
+        const { outward, inward } = mod.graphSpokeLabels(from, to, G);
+        assert(dist(outward, inward) > G.labelOffset, '两个标签挨太近了');
+        // 分别在连线的两侧：到直线的有符号距离应反号
+        const vx = to.x - from.x;
+        const vy = to.y - from.y;
+        const side = p => vx * (p.y - from.y) - vy * (p.x - from.x);
+        assert(side(outward) * side(inward) < 0, '两个标签应各在连线一侧');
+    }
+});
+check('标签离圆心够远，不会被圆心那个节点压住', () => {
+    for (const to of mod.graphLayout(8)) {
+        const { outward, inward } = mod.graphSpokeLabels({ x: G.cx, y: G.cy }, to, G);
+        // 圆心节点最大宽度 26% → 半宽 13%，标签至少要在 13% 之外
+        assert(dist(outward, { x: G.cx, y: G.cy }) > 13, '外向标签离圆心太近');
+        assert(dist(inward, { x: G.cx, y: G.cy }) > 13, '内向标签离圆心太近');
+        assert(outward.x > 0 && outward.x < 100 && inward.x > 0 && inward.x < 100, '标签横向越界');
+    }
+});
+check('标签不会压到任何一个节点方框上（斜向辐条最容易出问题）', () => {
+    const outside = (p, c, hw, hh) => Math.abs(p.x - c.x) > hw || Math.abs(p.y - c.y) > hh;
+    for (const count of [1, 2, 3, 4, 5, 6, 8, 12]) {
+        const from = { x: G.cx, y: G.cy };
+        for (const to of mod.graphLayout(count)) {
+            const { outward, inward } = mod.graphSpokeLabels(from, to, G);
+            for (const label of [outward, inward]) {
+                assert(outside(label, from, G.nodeHalfWidth, G.centerHalfHeight),
+                    `标签压住圆心节点：count=${count} label=${JSON.stringify(label)}`);
+                assert(outside(label, to, G.nodeHalfWidth, G.nodeHalfHeight),
+                    `标签压住外围节点：count=${count} label=${JSON.stringify(label)}`);
+            }
+        }
+    }
+});
+check('弦的控制点把弧线推离圆心', () => {
+    const ring = mod.graphLayout(4);
+    const { mid, control } = mod.graphChordControl(ring[0], ring[2], G);
+    assert(dist(mid, { x: G.cx, y: G.cy }) < 1, '上下的中点本来就该在圆心附近');
+    assert(dist(control, { x: G.cx, y: G.cy }) > G.chordBulge * 0.9, '正对时该往侧面鼓出去');
+});
+check('不相邻的两个外围节点，弧线朝外鼓', () => {
+    const ring = mod.graphLayout(3);
+    const a = ring[0];
+    const b = ring[1];
+    const { mid, control } = mod.graphChordControl(a, b, G);
+    assert(dist(control, { x: G.cx, y: G.cy }) > dist(mid, { x: G.cx, y: G.cy }), '控制点应比中点更远离圆心');
+});
+
 /* ---------------- 汇总 ---------------- */
 
 console.log(`\n通过 ${passed} 项，失败 ${failures.length} 项`);

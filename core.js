@@ -140,6 +140,8 @@ export function defaultSettings() {
             injectNovel: false,  // 是否把当前小说的称呼表也注入提示词
         },
         novels: { version: SCHEMA_VERSION, items: {}, activeId: null },
+        // 界面偏好：关系默认用放射图看（表格留着手工改）
+        ui: { relationsView: 'graph', novelView: 'graph' },
         library: {},
     };
 }
@@ -152,6 +154,7 @@ export function normalizeSettings(raw) {
     const scan = { ...base.scan, ...(src.scan && typeof src.scan === 'object' ? src.scan : {}) };
     const extract = { ...base.extract, ...(src.extract && typeof src.extract === 'object' ? src.extract : {}) };
     const custom = { ...base.extract.custom, ...(extract.custom && typeof extract.custom === 'object' ? extract.custom : {}) };
+    const ui = { ...base.ui, ...(src.ui && typeof src.ui === 'object' ? src.ui : {}) };
 
     inject.depth = clampInt(inject.depth, 0, 10000, base.inject.depth);
     inject.position = [0, 1, 2].includes(Number(inject.position)) ? Number(inject.position) : base.inject.position;
@@ -178,12 +181,16 @@ export function normalizeSettings(raw) {
         .slice(0, 500);
     extract.custom = custom;
 
+    ui.relationsView = ['graph', 'table'].includes(ui.relationsView) ? ui.relationsView : 'graph';
+    ui.novelView = ['graph', 'table'].includes(ui.novelView) ? ui.novelView : 'graph';
+
     return {
         ...base,
         ...src,
         inject,
         scan,
         extract,
+        ui,
         novels: normalizeNovels(src.novels),
         library: normalizeLibrary(src.library),
     };
@@ -414,6 +421,167 @@ export function composeInlineTable({ participants = [], chatState = null, librar
         }
     }
     return items.sort((a, b) => a.localeCompare(b, 'zh-Hans-CN')).join('；');
+}
+
+/* ------------------------------------------------------------------ *
+ * 关系图（放射状）
+ *
+ * 选一个核心角色当圆心，其他人放射状摆在周围：
+ *   spokes —— 核心 ↔ 每个人的双向称呼（→ 是核心这么叫对方，← 是对方这么叫核心）
+ *   chords —— 外围角色两两之间的关系（角色一多就不画，免得糊成一团）
+ * 纯数据，画图在 ui.js。
+ * ------------------------------------------------------------------ */
+
+/** 外围同时最多画几条弦；超过这个数就只显示与核心的关系。 */
+export const GRAPH_MAX_CHORDS_NODES = 5;
+
+/**
+ * 图形几何参数。坐标系是 0–100 的百分比，容器靠 CSS 撑成正方形。
+ * 抽出来是为了能离线验证「标签会不会压住圆心节点」这类看不见的问题。
+ */
+export const GRAPH_GEOMETRY = {
+    cx: 50,
+    cy: 50,
+    radius: 33,
+    // 标签沿辐条的位置（0=圆心 1=外围节点）。0.62 是算过的：
+    // 再往外挪，斜向辐条上的标签就会压到外围节点（节点最宽 26%，半宽 13）。
+    labelT: 0.62,
+    labelOffset: 9,    // 两个方向的标签各往垂直方向偏多少，避免叠在一起
+    chordBulge: 16,    // 弦往外鼓多少，免得正好穿过圆心
+    // 节点当成矩形做避让判断用的半尺寸（百分比），与 style.css 里的 max-width 对应
+    nodeHalfWidth: 13,
+    nodeHalfHeight: 5,
+    centerHalfHeight: 7,
+};
+
+/** 外围节点的坐标：从正上方开始，均匀分布。 */
+export function graphLayout(count, geometry = GRAPH_GEOMETRY) {
+    const n = Math.max(0, Number(count) || 0);
+    const out = [];
+    for (let i = 0; i < n; i += 1) {
+        const angle = ((-90 + (360 / n) * i) * Math.PI) / 180;
+        out.push({
+            x: geometry.cx + geometry.radius * Math.cos(angle),
+            y: geometry.cy + geometry.radius * Math.sin(angle),
+        });
+    }
+    return out;
+}
+
+/** 一条辐条上两个方向标签的位置：分居连线两侧。 */
+export function graphSpokeLabels(from, to, geometry = GRAPH_GEOMETRY) {
+    const vx = to.x - from.x;
+    const vy = to.y - from.y;
+    const len = Math.hypot(vx, vy) || 1;
+    const px = -vy / len;
+    const py = vx / len;
+    const baseX = from.x + vx * geometry.labelT;
+    const baseY = from.y + vy * geometry.labelT;
+    const off = geometry.labelOffset;
+    return {
+        outward: { x: baseX + px * off, y: baseY + py * off },
+        inward: { x: baseX - px * off, y: baseY - py * off },
+    };
+}
+
+/** 外围两人之间的弧线控制点，以及弧线中点（放标签用）。 */
+export function graphChordControl(a, b, geometry = GRAPH_GEOMETRY) {
+    const mx = (a.x + b.x) / 2;
+    const my = (a.y + b.y) / 2;
+    let dx = mx - geometry.cx;
+    let dy = my - geometry.cy;
+    if (Math.hypot(dx, dy) < 1) {
+        // 两点正好关于圆心对称，中点在圆心上，改成沿垂直方向鼓出去
+        dx = -(b.y - a.y);
+        dy = b.x - a.x;
+    }
+    const norm = Math.hypot(dx, dy) || 1;
+    return {
+        mid: { x: mx, y: my },
+        control: { x: mx + (dx / norm) * geometry.chordBulge, y: my + (dy / norm) * geometry.chordBulge },
+    };
+}
+
+export function buildRelationGraph({ participants = [], chatState = null, library = null, centerKey = null } = {}) {
+    const list = (participants ?? []).filter(p => p && p.key);
+    const center = list.find(p => p.key === centerKey) ?? list[0] ?? null;
+    if (!center) return { center: null, nodes: [], spokes: [], chords: [], chordsSkipped: 0 };
+
+    const others = list.filter(p => p.key !== center.key);
+    const lookup = (from, to) => {
+        const hit = resolveRelation({ chatState, library, from: from.key, to: to.key });
+        if (!hit) return null;
+        const call = appellationText(hit);
+        if (!call) return null;
+        return { call, aliases: hit.relation.aliases ?? [], source: hit.source };
+    };
+
+    const spokes = others.map(other => ({
+        key: other.key,
+        name: other.name,
+        kind: other.kind,
+        outward: lookup(center, other),   // 核心 → 对方
+        inward: lookup(other, center),    // 对方 → 核心
+    }));
+
+    const chords = [];
+    let chordsSkipped = 0;
+    if (others.length <= GRAPH_MAX_CHORDS_NODES) {
+        for (let i = 0; i < others.length; i += 1) {
+            for (let j = i + 1; j < others.length; j += 1) {
+                const aToB = lookup(others[i], others[j]);
+                const bToA = lookup(others[j], others[i]);
+                if (aToB || bToA) {
+                    chords.push({
+                        a: others[i].key,
+                        b: others[j].key,
+                        aName: others[i].name,
+                        bName: others[j].name,
+                        aToB,
+                        bToA,
+                    });
+                }
+            }
+        }
+    } else {
+        // 数一下被省掉的弦，好在界面上如实说明「不是没有，是没画」
+        for (let i = 0; i < others.length; i += 1) {
+            for (let j = i + 1; j < others.length; j += 1) {
+                if (lookup(others[i], others[j]) || lookup(others[j], others[i])) chordsSkipped += 1;
+            }
+        }
+    }
+
+    return {
+        center: { key: center.key, name: center.name, kind: center.kind },
+        nodes: list.map(p => ({ key: p.key, name: p.name, kind: p.kind })),
+        spokes,
+        chords,
+        chordsSkipped,
+    };
+}
+
+/**
+ * 把小说称呼表（人名级）转成画图用的输入。
+ * 小说里没有「用户」，所以全部当成 character，键统一加 name: 前缀。
+ */
+export function novelGraphInput(table) {
+    const names = [];
+    for (const row of table ?? []) {
+        if (!names.includes(row.from)) names.push(row.from);
+        if (!names.includes(row.to)) names.push(row.to);
+    }
+    const participants = names.map(name => ({ key: `name:${name}`, name, kind: 'character' }));
+    const library = {};
+    for (const row of table ?? []) {
+        library[relationKey(`name:${row.from}`, `name:${row.to}`)] = {
+            call: row.call,
+            aliases: row.aliases ?? [],
+            stage: '',
+            note: '',
+        };
+    }
+    return { participants, library };
 }
 
 /* ------------------------------------------------------------------ *

@@ -202,6 +202,52 @@ export function clampInt(value, min, max, fallback) {
     return Math.min(max, Math.max(min, n));
 }
 
+/**
+ * 把文件字节解成文本。
+ *
+ * 中文小说 txt 十有八九是 GBK / GB18030，直接当 UTF-8 读会整篇乱码（满屏 ），
+ * 所以这里按 BOM → 严格 UTF-8 → GB18030 → Big5 的顺序试，返回实际用的编码。
+ */
+export function decodeTextBuffer(input) {
+    const bytes = input instanceof Uint8Array ? input : new Uint8Array(input ?? []);
+    const tryDecode = (encoding, slice) => {
+        try {
+            return new TextDecoder(encoding).decode(slice ?? bytes);
+        } catch {
+            return null;
+        }
+    };
+
+    if (bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) {
+        return { text: tryDecode('utf-8', bytes.subarray(3)) ?? '', encoding: 'UTF-8 (BOM)' };
+    }
+    if (bytes.length >= 2 && bytes[0] === 0xFF && bytes[1] === 0xFE) {
+        const text = tryDecode('utf-16le', bytes.subarray(2));
+        if (text !== null) return { text, encoding: 'UTF-16 LE' };
+    }
+    if (bytes.length >= 2 && bytes[0] === 0xFE && bytes[1] === 0xFF) {
+        const text = tryDecode('utf-16be', bytes.subarray(2));
+        if (text !== null) return { text, encoding: 'UTF-16 BE' };
+    }
+
+    // 严格模式：能当成 UTF-8 解出来就一定是 UTF-8
+    let utf8 = null;
+    try {
+        utf8 = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    } catch {
+        utf8 = null;
+    }
+    if (utf8 !== null) return { text: utf8, encoding: 'UTF-8' };
+
+    for (const encoding of ['gb18030', 'big5']) {
+        const text = tryDecode(encoding);
+        if (text !== null && !text.includes('\uFFFD') && text.length) return { text, encoding };
+    }
+
+    // 实在认不出来：用宽松 UTF-8 兜底，让用户至少能看到内容决定怎么办
+    return { text: new TextDecoder('utf-8').decode(bytes), encoding: '认不出的编码（可能有乱码）' };
+}
+
 /* ------------------------------------------------------------------ *
  * 参与者（用户 + 当前角色 / 群成员）
  * ------------------------------------------------------------------ */

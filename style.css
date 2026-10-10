@@ -282,6 +282,11 @@
     color: inherit;
 }
 
+#stam-panel .stam-textarea.stam-drop {
+    border-color: var(--SmartThemeQuoteColor, #c9a227);
+    border-style: dashed;
+}
+
 #stam-panel .stam-progress {
     height: 8px;
     border-radius: 4px;

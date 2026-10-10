@@ -737,6 +737,63 @@ check('不相邻的两个外围节点，弧线朝外鼓', () => {
     assert(dist(control, { x: G.cx, y: G.cy }) > dist(mid, { x: G.cx, y: G.cy }), '控制点应比中点更远离圆心');
 });
 
+/* ---------------- 小说 txt 编码识别 ---------------- */
+
+console.log('\n小说 txt 编码识别');
+
+const encode = (text, encoding) => {
+    // 只用来生成测试字节；Node 的 TextEncoder 只支持 utf-8，其余手写
+    if (encoding === 'utf-8') return new TextEncoder().encode(text);
+    if (encoding === 'utf-16le') {
+        const bytes = new Uint8Array(text.length * 2);
+        for (let i = 0; i < text.length; i += 1) {
+            const code = text.charCodeAt(i);
+            bytes[i * 2] = code & 0xFF;
+            bytes[i * 2 + 1] = code >> 8;
+        }
+        return bytes;
+    }
+    throw new Error(`测试没实现 ${encoding}`);
+};
+
+check('正常 UTF-8 直接认出来', () => {
+    const result = mod.decodeTextBuffer(encode('白鹭看着星野。', 'utf-8'));
+    assertEqual(result.text, '白鹭看着星野。');
+    assertEqual(result.encoding, 'UTF-8');
+});
+check('UTF-8 BOM 会被剥掉，不留下看不见的字符', () => {
+    const raw = encode('白鹭', 'utf-8');
+    const withBom = new Uint8Array([0xEF, 0xBB, 0xBF, ...raw]);
+    const result = mod.decodeTextBuffer(withBom);
+    assertEqual(result.text, '白鹭');
+    assertEqual(result.encoding, 'UTF-8 (BOM)');
+});
+check('UTF-16 LE 带 BOM 能读', () => {
+    const raw = encode('白鹭', 'utf-16le');
+    const withBom = new Uint8Array([0xFF, 0xFE, ...raw]);
+    const result = mod.decodeTextBuffer(withBom);
+    assertEqual(result.text, '白鹭');
+    assertEqual(result.encoding, 'UTF-16 LE');
+});
+check('GBK 小说不会变成满屏乱码（关键：不能落回 UTF-8）', () => {
+    // GBK 字节：白 潞 —— 这不是合法 UTF-8，正好用来验证回退
+    const gbk = new Uint8Array([0xB0, 0xD7, 0xC2, 0xBA]);
+    const result = mod.decodeTextBuffer(gbk);
+    assertEqual(result.encoding, 'gb18030');
+    assertEqual(result.text, new TextDecoder('gb18030').decode(gbk));
+    assert(!result.text.includes('\uFFFD'), '不该出现替换字符');
+    // 反证：直接当 UTF-8 读确实会坏
+    assert(new TextDecoder('utf-8').decode(gbk).includes('\uFFFD'), 'UTF-8 读这串本来就该坏，测试前提成立');
+});
+check('空文件不抛错，返回空文本', () => {
+    const result = mod.decodeTextBuffer(new Uint8Array([]));
+    assertEqual(result.text, '');
+});
+check('传 null / undefined 也不炸', () => {
+    assertEqual(mod.decodeTextBuffer(null).text, '');
+    assertEqual(mod.decodeTextBuffer(undefined).text, '');
+});
+
 /* ---------------- 汇总 ---------------- */
 
 console.log(`\n通过 ${passed} 项，失败 ${failures.length} 项`);

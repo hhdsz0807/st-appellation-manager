@@ -1,6 +1,6 @@
 {
     "name": "st-appellation-manager",
-    "version": "1.3.0",
+    "version": "1.3.1",
     "private": true,
     "type": "module",
     "description": "SillyTavern 扩展：管理角色↔用户、角色↔角色之间的称呼",
@@ -8,5 +8,6 @@
         "test": "node test-core.mjs && node test-extract.mjs"
     }
 }
+
 
 

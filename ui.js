@@ -6,7 +6,7 @@
  * 图形几何参数与布局算法在 core.js 里（纯函数、可离线测），这里只管画。
  */
 
-import { GRAPH_GEOMETRY, graphChordControl, graphLayout, graphSpokeLabels } from './core.js';
+import { GRAPH_GEOMETRY, decodeTextBuffer, graphChordControl, graphLayout, graphSpokeLabels } from './core.js';
 
 const STAGE_SUGGESTIONS = ['初见', '认识', '熟悉', '亲密', '恋人', '家人', '搭档', '敌对', '决裂'];
 
@@ -181,7 +181,7 @@ function createExtractSection(api, setStatus) {
         id: 'stam-extract-text',
         class: 'stam-textarea',
         rows: '6',
-        placeholder: '把小说正文粘贴到这里，或点下面的按钮导入 .txt / .md 文件。\n\n正文只留在浏览器内存里，不会写进聊天记录——刷新页面后需要重新粘贴（提取出来的结果会保留）。',
+        placeholder: '把小说正文粘贴到这里，点下面的按钮选 txt 文件，或者直接把 txt 拖进这个框。\n\nGBK / UTF-16 的老小说也能读（会自动认编码）。\n正文只留在浏览器内存里，不会写进盘——刷新页面后需要重新导入（称呼表本身是持久化的）。',
     });
     textarea.value = api.getExtractText();
     textarea.addEventListener('input', () => {
@@ -189,21 +189,41 @@ function createExtractSection(api, setStatus) {
         updatePlan();
     });
 
-    const fileInput = el('input', { type: 'file', accept: '.txt,.md,text/plain', style: { display: 'none' } });
-    fileInput.addEventListener('change', async () => {
-        const file = fileInput.files?.[0];
-        fileInput.value = '';
+    /** 读小说文件：自己认编码，免得 GBK 的 txt 读进来全是乱码。 */
+    async function loadNovelFile(file) {
         if (!file) return;
         try {
-            const text = await file.text();
+            const { text, encoding } = decodeTextBuffer(new Uint8Array(await file.arrayBuffer()));
             textarea.value = text;
             ui.sourceName = file.name;
             api.setExtractText(text, file.name);
             updatePlan();
-            setStatus(`已读入 ${file.name}（${text.length} 字）`);
+            const chinese = (text.match(/[\u4e00-\u9fa5]/g) ?? []).length;
+            const looksBroken = text.includes('\uFFFD') || (text.length > 200 && chinese < text.length * 0.02);
+            setStatus(looksBroken
+                ? `已读入 ${file.name}（${text.length} 字，按 ${encoding} 解的）——中文比例很低，可能编码认错了`
+                : `已读入 ${file.name}（${text.length} 字，编码 ${encoding}）`);
         } catch (error) {
             setStatus(`读文件失败：${error.message}`);
         }
+    }
+
+    const fileInput = el('input', { type: 'file', accept: '.txt,.md,.text,text/plain,.json', style: { display: 'none' } });
+    fileInput.addEventListener('change', async () => {
+        const file = fileInput.files?.[0];
+        fileInput.value = '';
+        await loadNovelFile(file);
+    });
+
+    textarea.addEventListener('dragover', event => {
+        event.preventDefault();
+        textarea.classList.add('stam-drop');
+    });
+    textarea.addEventListener('dragleave', () => textarea.classList.remove('stam-drop'));
+    textarea.addEventListener('drop', async event => {
+        event.preventDefault();
+        textarea.classList.remove('stam-drop');
+        await loadNovelFile(event.dataTransfer?.files?.[0]);
     });
 
     /* ---------- 模型来源 ---------- */
@@ -415,7 +435,7 @@ function createExtractSection(api, setStatus) {
             el('div', { class: 'stam-extract-body' }, [
                 textarea,
                 el('div', { class: 'stam-toolbar' }, [
-                    button('导入 txt / md 文件', () => fileInput.click()),
+                    button('导入小说原文（txt / md）', () => fileInput.click()),
                     button('清空正文', () => {
                         textarea.value = '';
                         ui.sourceName = '';
@@ -444,10 +464,14 @@ function createExtractSection(api, setStatus) {
         ]),
         el('div', { class: 'stam-toolbar' }, [
             button('复制表格', () => api.copyNovelTable()),
-            button('导出本小说 JSON', () => api.exportNovelFile()),
-            button('导入小说 JSON', () => api.importNovelFile()),
+            button('导出称呼表 JSON', () => api.exportNovelFile()),
+            button('导入称呼表 JSON', () => api.importNovelFile()),
             el('label', { class: 'stam-check' }, [injectNovelCheck, el('span', { text: '把这张表一起注入提示词' })]),
         ]),
+        el('div', {
+            class: 'stam-hint',
+            text: 'JSON 是这个扩展自己导出的备份/分享格式（别人跑好的称呼表）。小说原文不用 JSON，用上面「导入小说原文（txt / md）」或直接拖 txt 进来。',
+        }),
         novelViewBar,
         novelCenterBar,
         novelGraphBox,
